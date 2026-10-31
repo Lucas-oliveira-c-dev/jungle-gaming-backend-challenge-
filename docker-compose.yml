@@ -1,0 +1,63 @@
+name: wagering
+
+x-app: &app
+  build: .
+  depends_on:
+    postgres: { condition: service_healthy }
+    sqs: { condition: service_started }
+    migrate: { condition: service_completed_successfully }
+  environment: &app-env
+    DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+    SQS_ENDPOINT: http://sqs:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    PORT: "3000"
+    LOG_LEVEL: info
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports: ["5432:5432"]
+    command: ["postgres", "-c", "max_connections=300"]
+    volumes:
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # MiniStack: MIT-licensed, token-free AWS emulator (LocalStack >= 2026.03 requires an auth token).
+  sqs:
+    image: ministackorg/ministack:latest
+    ports: ["4566:4566"]
+
+  migrate:
+    build: .
+    command: ["bun", "scripts/migrate.ts", "up"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  # Three instances share the same database and queues (section 8: >= 3 instances).
+  app-1:
+    <<: *app
+    environment: { <<: *app-env, INSTANCE_ID: app-1 }
+    ports: ["3001:3000"]
+  app-2:
+    <<: *app
+    environment: { <<: *app-env, INSTANCE_ID: app-2 }
+    ports: ["3002:3000"]
+  app-3:
+    <<: *app
+    environment: { <<: *app-env, INSTANCE_ID: app-3 }
+    ports: ["3003:3000"]
