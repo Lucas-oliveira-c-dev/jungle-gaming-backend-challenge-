@@ -8,6 +8,7 @@ import {
 } from '@aws-sdk/client-sqs';
 import { z } from 'zod';
 import { IdempotencyConflictError, ValidationError, WalletNotFoundError } from '../../application/errors';
+import { DomainError } from '../../domain/errors';
 import type { AppLogger } from '../../application/ports';
 import type { SubmitWagerTransaction } from '../../application/submit-wager-transaction';
 import { canonicalJson, parseWagerSubmission, sha256 } from '../../application/wager-request';
@@ -100,23 +101,47 @@ export class WagerTransactionConsumer {
         continue;
       }
 
-      // Same FIFO group arrives in order: process sequentially within a batch.
-      for (const [position, message] of messages.entries()) {
-        if (this.stopping) {
-          await this.release(messages.slice(position));
-          break;
-        }
-        this.inFlight += 1;
-        try {
-          await this.handle(message);
-        } finally {
-          this.inFlight -= 1;
-        }
+      await this.processBatch(index, messages);
+    }
+  }
+
+  /**
+   * Messages of one FIFO group arrive in order and are processed sequentially. If one is
+   * left for retry, the rest of its group in this batch is deferred with it, so order holds.
+   * Visibility is extended when a slow batch (hot wallet) approaches the timeout.
+   */
+  private async processBatch(loopIndex: number, messages: Message[]): Promise<void> {
+    const deferredGroups = new Map<string, number>(); // group -> retry delay (s)
+    let leaseStartedAt = Date.now();
+    for (const [position, message] of messages.entries()) {
+      if (this.stopping) {
+        await this.changeVisibility(messages.slice(position), 0);
+        return;
+      }
+      const group = message.Attributes?.MessageGroupId ?? '';
+      const deferral = deferredGroups.get(group);
+      if (deferral !== undefined) {
+        await this.changeVisibility([message], deferral);
+        continue;
+      }
+      if (Date.now() - leaseStartedAt > this.options.visibilityTimeoutSeconds * 600) {
+        await this.changeVisibility(messages.slice(position), this.options.visibilityTimeoutSeconds);
+        leaseStartedAt = Date.now();
+      }
+      this.inFlight += 1;
+      try {
+        const outcome = await this.handle(message);
+        if (outcome.retryInSeconds !== undefined) deferredGroups.set(group, outcome.retryInSeconds);
+      } catch (error) {
+        // Never let one message kill the loop; it will be redelivered after its visibility.
+        this.logger.error({ loop: loopIndex, sqsMessageId: message.MessageId, err: (error as Error).message }, 'unexpected consumer error');
+      } finally {
+        this.inFlight -= 1;
       }
     }
   }
 
-  private async handle(message: Message): Promise<void> {
+  private async handle(message: Message): Promise<{ retryInSeconds?: number }> {
     const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? '1');
     const fields: Record<string, unknown> = { sqsMessageId: message.MessageId, receiveCount };
     let disposition: Disposition;
@@ -147,38 +172,61 @@ export class WagerTransactionConsumer {
         : result.status === WagerTransactionStatus.Rejected
           ? 'business_rejection'
           : 'processed';
-      await this.ack(message);
     } catch (error) {
-      disposition = await this.handleFailure(message, error, receiveCount, fields);
+      const failure = await this.handleFailure(message, error, receiveCount, fields);
+      this.metrics.messageHandled(failure.disposition);
+      return failure;
     }
+    // Committed. A failed ack is harmless: the redelivery is absorbed by the inbox, so it
+    // must not be treated as a processing failure (which could send it to the DLQ).
+    await this.ack(message).catch((error) =>
+      this.logger.warn({ ...fields, err: (error as Error).message }, 'ack failed after commit; redelivery will be deduplicated'),
+    );
     this.metrics.messageHandled(disposition);
+    return {};
   }
 
-  private async handleFailure(message: Message, error: unknown, receiveCount: number, fields: Record<string, unknown>): Promise<Disposition> {
-    if (error instanceof SyntaxError || error instanceof ValidationError || error instanceof IdempotencyConflictError) {
-      const reason = error instanceof IdempotencyConflictError ? error.code : 'INVALID_PAYLOAD';
-      this.logger.warn({ ...fields, reason, err: error.message }, 'permanent message failure, moving to DLQ');
-      await this.moveToDlq(message, reason);
-      return 'dlq';
+  private async handleFailure(
+    message: Message,
+    error: unknown,
+    receiveCount: number,
+    fields: Record<string, unknown>,
+  ): Promise<{ disposition: Disposition; retryInSeconds?: number }> {
+    const permanent =
+      error instanceof SyntaxError || error instanceof ValidationError || error instanceof IdempotencyConflictError || error instanceof DomainError;
+    if (permanent) {
+      const reason =
+        error instanceof IdempotencyConflictError ? error.code : error instanceof DomainError ? 'DOMAIN_INVARIANT' : 'INVALID_PAYLOAD';
+      this.logger.warn({ ...fields, reason, err: (error as Error).message }, 'permanent message failure, moving to DLQ');
+      return this.moveToDlqOrRetry(message, reason, fields);
     }
     if (error instanceof WalletNotFoundError) {
       this.logger.warn({ ...fields, reason: error.code }, 'business rejection, acking');
-      await this.ack(message);
-      return 'business_rejection';
+      await this.ack(message).catch(() => undefined); // if it fails, the redelivery is rejected again
+      return { disposition: 'business_rejection' };
     }
     if (receiveCount >= this.options.maxReceiveCount) {
       this.logger.error({ ...fields, err: (error as Error).message }, 'retry budget exhausted, moving to DLQ');
-      await this.moveToDlq(message, 'MAX_RECEIVE_COUNT_EXCEEDED');
-      return 'dlq';
+      return this.moveToDlqOrRetry(message, 'MAX_RECEIVE_COUNT_EXCEEDED', fields);
     }
     // Transient: let it come back after an exponential backoff (2s, 4s, 8s ... max 60s).
     const delay = Math.min(60, 2 ** receiveCount);
     this.metrics.retry('consumer');
     this.logger.warn({ ...fields, retryInSeconds: delay, err: (error as Error).message }, 'transient failure, message will be retried');
-    await this.sqs
-      .send(new ChangeMessageVisibilityCommand({ QueueUrl: this.options.queueUrl, ReceiptHandle: message.ReceiptHandle!, VisibilityTimeout: delay }))
-      .catch(() => undefined);
-    return 'retry';
+    await this.changeVisibility([message], delay);
+    return { disposition: 'retry', retryInSeconds: delay };
+  }
+
+  /** If the broker itself fails while dead-lettering, leave the message for redelivery. */
+  private async moveToDlqOrRetry(message: Message, reason: string, fields: Record<string, unknown>) {
+    try {
+      await this.moveToDlq(message, reason);
+      return { disposition: 'dlq' as const };
+    } catch (error) {
+      this.logger.warn({ ...fields, reason, err: (error as Error).message }, 'could not move message to DLQ, will retry');
+      this.metrics.retry('consumer');
+      return { disposition: 'retry' as const, retryInSeconds: this.options.visibilityTimeoutSeconds };
+    }
   }
 
   private async ack(message: Message): Promise<void> {
@@ -202,10 +250,12 @@ export class WagerTransactionConsumer {
     await this.ack(message);
   }
 
-  private async release(messages: Message[]): Promise<void> {
+  private async changeVisibility(messages: Message[], seconds: number): Promise<void> {
     await Promise.allSettled(
       messages.map((m) =>
-        this.sqs.send(new ChangeMessageVisibilityCommand({ QueueUrl: this.options.queueUrl, ReceiptHandle: m.ReceiptHandle!, VisibilityTimeout: 0 })),
+        this.sqs.send(
+          new ChangeMessageVisibilityCommand({ QueueUrl: this.options.queueUrl, ReceiptHandle: m.ReceiptHandle!, VisibilityTimeout: seconds }),
+        ),
       ),
     );
   }
