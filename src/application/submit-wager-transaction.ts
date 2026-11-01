@@ -61,7 +61,7 @@ export class SubmitWagerTransaction {
 
     try {
       // Fast path (no lock): most retries end here.
-      const known = await this.store.findTransactionByIdempotencyKey(idempotencyKey);
+      const known = await this.store.findTransactionByIdempotencyKey(request.providerId, idempotencyKey);
       if (known && !ctx.inbox) return this.replay(known, payloadHash, logFields);
 
       let recorded: WagerTransaction | undefined;
@@ -75,7 +75,7 @@ export class SubmitWagerTransaction {
           inbox.markProcessed(uow.now());
           if (!(await uow.registerInbox(inbox))) {
             this.metrics.duplicateDetected('inbox_redelivery');
-            const previous = await uow.findTransactionByIdempotencyKey(idempotencyKey);
+            const previous = await uow.findTransactionByIdempotencyKey(request.providerId, idempotencyKey);
             if (!previous) throw new IdempotencyConflictError(`messageId ${ctx.inbox.messageId} was already used for another payload`);
             return this.replay(previous, payloadHash, logFields);
           }
@@ -83,7 +83,7 @@ export class SubmitWagerTransaction {
 
         // Authoritative idempotency check, serialized by the wallet lock.
         const existing =
-          (await uow.findTransactionByIdempotencyKey(idempotencyKey)) ??
+          (await uow.findTransactionByIdempotencyKey(request.providerId, idempotencyKey)) ??
           (await uow.findTransactionByExternalId(request.providerId, request.externalTransactionId));
         if (existing) return this.replay(existing, payloadHash, logFields, idempotencyKey);
 
@@ -123,7 +123,7 @@ export class SubmitWagerTransaction {
       if (this.store.isUniqueViolation(error)) {
         // Lost a race on a unique constraint (e.g. same key on another wallet): everything
         // was rolled back; answer from what the winner committed.
-        const winner = await this.store.findTransactionByIdempotencyKey(idempotencyKey);
+        const winner = await this.store.findTransactionByIdempotencyKey(request.providerId, idempotencyKey);
         if (winner) return this.replay(winner, payloadHash, logFields);
         throw new IdempotencyConflictError('Provider transaction id already used with another idempotency key');
       }

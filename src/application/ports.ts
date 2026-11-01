@@ -33,7 +33,8 @@ export interface WageringUnitOfWork {
   insertWallet(wallet: Wallet): Promise<void>;
   saveWallet(wallet: Wallet): Promise<void>;
 
-  findTransactionByIdempotencyKey(key: string): Promise<StoredTransaction | null>;
+  /** Idempotency keys are scoped per provider: one provider can never claim another's key. */
+  findTransactionByIdempotencyKey(providerId: string, key: string): Promise<StoredTransaction | null>;
   findTransactionByExternalId(providerId: string, externalTransactionId: string): Promise<StoredTransaction | null>;
   findTransactionById(id: string): Promise<StoredTransaction | null>;
   hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
@@ -59,7 +60,7 @@ export interface WageringStore {
   isTransient(error: unknown): boolean;
   isLockConflict(error: unknown): boolean;
   /** Non-locking read used for the idempotency fast path. */
-  findTransactionByIdempotencyKey(key: string): Promise<StoredTransaction | null>;
+  findTransactionByIdempotencyKey(providerId: string, key: string): Promise<StoredTransaction | null>;
   /** Due according to the database clock (shared by all instances, immune to app clock skew). */
   findDuePendingReferences(limit: number): Promise<{ id: string; walletId: string }[]>;
 }

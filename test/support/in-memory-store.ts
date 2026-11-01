@@ -58,7 +58,7 @@ export class InMemoryStore implements WageringStore {
       async saveWallet(w) {
         store.wallets.set(w.id, w);
       },
-      findTransactionByIdempotencyKey: async (key) => find((t) => t.idempotencyKey === key),
+      findTransactionByIdempotencyKey: async (providerId, key) => find((t) => t.providerId === providerId && t.idempotencyKey === key),
       findTransactionByExternalId: async (p, e) => find((t) => t.providerId === p && t.externalTransactionId === e),
       findTransactionById: async (id) => find((t) => t.id === id),
       async hasProcessedReversal(refId) {
@@ -88,8 +88,8 @@ export class InMemoryStore implements WageringStore {
     return work(uow);
   }
 
-  async findTransactionByIdempotencyKey(key: string) {
-    return this.transactional((uow) => uow.findTransactionByIdempotencyKey(key));
+  async findTransactionByIdempotencyKey(providerId: string, key: string) {
+    return this.transactional((uow) => uow.findTransactionByIdempotencyKey(providerId, key));
   }
 
   async findDuePendingReferences() {

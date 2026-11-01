@@ -63,8 +63,8 @@ class MikroOrmWageringUnitOfWork implements WageringUnitOfWork {
     record.updatedAt = wallet.updatedAt;
   }
 
-  async findTransactionByIdempotencyKey(key: string): Promise<StoredTransaction | null> {
-    const record = await this.em.findOne(WagerTransactionRecord, { idempotencyKey: key }, { refresh: true });
+  async findTransactionByIdempotencyKey(providerId: string, key: string): Promise<StoredTransaction | null> {
+    const record = await this.em.findOne(WagerTransactionRecord, { providerId, idempotencyKey: key }, { refresh: true });
     return record ? toStoredTransaction(record) : null;
   }
 
@@ -209,8 +209,8 @@ export class MikroOrmWageringStore implements WageringStore {
     return isLockConflict(error);
   }
 
-  async findTransactionByIdempotencyKey(key: string): Promise<StoredTransaction | null> {
-    const record = await this.orm.em.fork().findOne(WagerTransactionRecord, { idempotencyKey: key });
+  async findTransactionByIdempotencyKey(providerId: string, key: string): Promise<StoredTransaction | null> {
+    const record = await this.orm.em.fork().findOne(WagerTransactionRecord, { providerId, idempotencyKey: key });
     return record ? toStoredTransaction(record) : null;
   }
 

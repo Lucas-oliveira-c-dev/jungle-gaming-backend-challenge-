@@ -158,6 +158,19 @@ describe('HTTP API', () => {
     expect((await api(t.baseUrl, 'GET', '/ledger/trial-balance?currency=brl1')).status).toBe(400);
   });
 
+  test('idempotency keys are scoped per provider: one provider cannot block another', async () => {
+    const w = await createWallet(t.baseUrl, '100.00');
+    const sharedKey = 'provider-b:win-123'; // predictable key of provider-b
+    // provider-a claims provider-b's key first...
+    const squatter = await submit(t.baseUrl, wager(w, 'LOSS', '0.00', { providerId: 'provider-a' }), sharedKey);
+    expect(squatter.status).toBe(201);
+    // ...and provider-b's real transaction with that key is still processed, not a 409.
+    const legit = await submit(t.baseUrl, wager(w, 'WIN', '10.00', { providerId: 'provider-b' }), sharedKey);
+    expect(legit.status).toBe(201);
+    expect(legit.body).toMatchObject({ status: 'PROCESSED', balance: { amount: '110.00' }, idempotentReplay: false });
+    expect(legit.body.transactionId).not.toBe(squatter.body.transactionId);
+  });
+
   test('currency conflict is rejected and auditable', async () => {
     const w = await createWallet(t.baseUrl, '100.00');
     const res = await submit(t.baseUrl, { ...wager(w, 'BET', '1.00'), money: { amount: '1.00', currency: 'USD' } });

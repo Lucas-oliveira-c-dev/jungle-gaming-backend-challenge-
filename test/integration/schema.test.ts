@@ -133,7 +133,7 @@ describe('migrations and constraints', () => {
       `insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
         round_id, game_id, kind, amount, currency, status, created_at) values ('${crypto.randomUUID()}', 'p', '${ext}', '${key}', '${'b'.repeat(64)}',
         '${walletId}', '${playerId}', 'r', 'g', 'BET', 1, 'BRL', 'PENDING', now())`;
-    await expectSqlError([insert('p:e1', 'other')], /wager_tx_idempotency_key_uq/);
+    await expectSqlError([insert('p:e1', 'other')], /wager_tx_provider_idempotency_key_uq/);
     await expectSqlError([insert('other', 'e1')], /wager_tx_provider_external_uq/);
   });
 
@@ -200,7 +200,12 @@ describe('migrations and constraints', () => {
   // Last on purpose: it drops and recreates the schema, populated fixture included.
   test('migrations are reversible: down to zero on a populated database, then up again', async () => {
     const migrator = orm.getMigrator();
-    const all = ['Migration20261031000001_initial', 'Migration20261101000001_double_entry', 'Migration20261101000002_ledger_integrity'];
+    const all = [
+      'Migration20261031000001_initial',
+      'Migration20261101000001_double_entry',
+      'Migration20261101000002_ledger_integrity',
+      'Migration20261101000003_idempotency_per_provider',
+    ];
     expect((await migrator.getExecutedMigrations()).map((m) => m.name)).toEqual(all);
     await migrator.down({ to: 0 });
     const [gone] = await sql<{ n: string }>(orm, `select count(*)::text as n from pg_tables where schemaname = 'public' and tablename <> 'mikro_orm_migrations'`);

@@ -4,6 +4,7 @@ import type { AppConfig } from '../../config';
 import { Migration20261031000001_initial } from './migrations/Migration20261031000001_initial';
 import { Migration20261101000001_double_entry } from './migrations/Migration20261101000001_double_entry';
 import { Migration20261101000002_ledger_integrity } from './migrations/Migration20261101000002_ledger_integrity';
+import { Migration20261101000003_idempotency_per_provider } from './migrations/Migration20261101000003_idempotency_per_provider';
 import { ENTITY_SCHEMAS } from './records';
 
 export function ormConfig(config: Pick<AppConfig, 'databaseUrl' | 'dbPoolMax'> & { dbAcquireTimeoutMs?: number }) {
@@ -21,6 +22,7 @@ export function ormConfig(config: Pick<AppConfig, 'databaseUrl' | 'dbPoolMax'> &
         { name: 'Migration20261031000001_initial', class: Migration20261031000001_initial },
         { name: 'Migration20261101000001_double_entry', class: Migration20261101000001_double_entry },
         { name: 'Migration20261101000002_ledger_integrity', class: Migration20261101000002_ledger_integrity },
+        { name: 'Migration20261101000003_idempotency_per_provider', class: Migration20261101000003_idempotency_per_provider },
       ],
       transactional: true,
       allOrNothing: true,
