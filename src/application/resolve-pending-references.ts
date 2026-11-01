@@ -49,45 +49,52 @@ export class ResolvePendingReferences {
         const wallet = await uow.lockWallet(walletId);
         const stored = await uow.findTransactionById(transactionId);
         if (!wallet || stored?.transaction.status !== WagerTransactionStatus.PendingReference) return;
-        stored.transaction.fail(FailureCode.ProcessingFailed, this.clock.now());
+        stored.transaction.fail(FailureCode.ProcessingFailed, uow.now());
         await uow.updateTransaction(stored.transaction, wallet.balance);
+        await uow.wakePendingDependents(stored.transaction.walletId, stored.transaction.providerId, stored.transaction.externalTransactionId);
         this.metrics.transactionRecorded(stored.transaction.status, stored.transaction.kind, 'worker');
       })
       .catch((error) => this.logger.error({ transactionId, err: (error as Error).message }, 'could not mark transaction as FAILED'));
   }
 
   private async resolve(transactionId: string, walletId: string): Promise<boolean> {
-    return this.store.transactional(async (uow) => {
+    const resolved = await this.store.transactional(async (uow) => {
       const wallet = await uow.lockWallet(walletId);
       const stored = await uow.findTransactionById(transactionId);
-      if (!wallet || !stored) return false;
+      if (!wallet || !stored) return undefined;
       const { transaction: tx } = stored;
-      const now = this.clock.now();
-      if (tx.status !== WagerTransactionStatus.PendingReference) return false; // someone else got it
+      const now = uow.now();
+      if (tx.status !== WagerTransactionStatus.PendingReference) return undefined; // someone else got it
 
       const correlationId = `pending-reference:${tx.id}`;
-      const attempts = stored.referenceAttempts + 1;
       const outcome = await applyAndRecord(uow, tx, wallet, { correlationId, causationId: tx.id, now }, this.ids, {
         isNew: false,
-        referenceAttempts: attempts,
+        previousAttempts: stored.referenceAttempts,
       });
+      const attempts = outcome.referenceAttempts;
 
       if (outcome.type === 'pending_reference') {
-        if (attempts < this.maxAttempts) return false;
+        if (attempts < this.maxAttempts) return undefined;
         // Retry budget exhausted: the reference never arrived.
         tx.reject(FailureCode.ReferenceNotFound, now);
         await uow.updateTransaction(tx, wallet.balance);
         await uow.enqueue([
           WagerTransactionRejected.from(tx, wallet, { eventId: this.ids.next(), correlationId, causationId: tx.id, occurredAt: now }),
         ]);
+        // Transactions waiting on this one can now be rejected right away.
+        await uow.wakePendingDependents(tx.walletId, tx.providerId, tx.externalTransactionId);
       }
 
-      this.metrics.transactionRecorded(tx.status, tx.kind, 'worker');
-      this.logger.info(
-        { correlationId, transactionId: tx.id, walletId, providerId: tx.providerId, status: tx.status, failureCode: tx.failureCode, attempts },
-        'pending reference resolved',
-      );
-      return true;
+      return { tx, attempts };
     });
+    if (!resolved) return false;
+    // After COMMIT only.
+    const { tx, attempts } = resolved;
+    this.metrics.transactionRecorded(tx.status, tx.kind, 'worker');
+    this.logger.info(
+      { correlationId: `pending-reference:${tx.id}`, transactionId: tx.id, walletId, providerId: tx.providerId, status: tx.status, failureCode: tx.failureCode, attempts },
+      'pending reference resolved',
+    );
+    return true;
   }
 }

@@ -40,7 +40,8 @@ export interface WageringUnitOfWork {
   insertTransaction(tx: WagerTransaction, resultBalance: Money | undefined, schedule?: PendingReferenceSchedule): Promise<void>;
   updateTransaction(tx: WagerTransaction, resultBalance: Money | undefined, schedule?: PendingReferenceSchedule): Promise<void>;
   /** Makes transactions waiting for (providerId, externalTransactionId) due immediately. */
-  wakePendingDependents(providerId: string, externalTransactionId: string): Promise<number>;
+  /** Scoped to the locked wallet: references can only be valid within the same wallet. */
+  wakePendingDependents(walletId: string, providerId: string, externalTransactionId: string): Promise<number>;
 
   /**
    * Writes a wallet sub-ledger entry together with its double-entry journal entry —

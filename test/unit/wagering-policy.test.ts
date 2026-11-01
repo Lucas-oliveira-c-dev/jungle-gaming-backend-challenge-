@@ -191,6 +191,27 @@ describe('ROLLBACK', () => {
   });
 });
 
+describe('settling a reversed BET', () => {
+  test('WIN/LOSS against a refunded BET is rejected (no prize on a cancelled bet)', () => {
+    const w = wallet();
+    const bet = processed(K.Bet, '10.00', w);
+    const win = tx(K.Win, '50.00', { referenceExternalTransactionId: bet.externalTransactionId });
+    expect(run(win, w, bet, true)).toEqual({ type: 'rejected', code: FailureCode.ReferenceAlreadyReversed });
+    const loss = tx(K.Loss, '0.00', { referenceExternalTransactionId: bet.externalTransactionId });
+    expect(run(loss, w, bet, true)).toEqual({ type: 'rejected', code: FailureCode.ReferenceAlreadyReversed });
+    expect(w.balance.toString()).toBe('90.00');
+  });
+
+  test('pending outcome tells whether the reference exists but is itself pending', () => {
+    const w = wallet();
+    const refund = tx(K.Refund, '10.00', { referenceExternalTransactionId: 'not-yet' });
+    expect(run(refund, w)).toEqual({ type: 'pending_reference', referenceFound: false });
+    const pendingBet = WagerTransaction.rehydrate({ ...tx(K.Refund, '10.00', { referenceExternalTransactionId: 'x' }), status: S.PendingReference } as never);
+    const rollback = tx(K.Rollback, '10.00', { referenceExternalTransactionId: pendingBet.externalTransactionId });
+    expect(run(rollback, w, pendingBet)).toEqual({ type: 'pending_reference', referenceFound: true });
+  });
+});
+
 describe('cross-cutting rules', () => {
   test('currency conflict is rejected and auditable', () => {
     const w = wallet();

@@ -64,7 +64,9 @@ export class SubmitWagerTransaction {
       const known = await this.store.findTransactionByIdempotencyKey(idempotencyKey);
       if (known && !ctx.inbox) return this.replay(known, payloadHash, logFields);
 
+      let recorded: WagerTransaction | undefined;
       const result = await this.store.transactional(async (uow) => {
+        recorded = undefined; // the store may re-run the callback; only the committed run counts
         const wallet = await uow.lockWallet(request.walletId);
         if (!wallet) throw new WalletNotFoundError(`Wallet ${request.walletId} not found`);
 
@@ -95,13 +97,9 @@ export class SubmitWagerTransaction {
         });
         await applyAndRecord(uow, tx, wallet, { correlationId: ctx.correlationId, causationId: ctx.causationId, now }, this.ids, {
           isNew: true,
-          referenceAttempts: 0,
+          previousAttempts: 0,
         });
-        this.metrics.transactionRecorded(tx.status, tx.kind, ctx.source);
-        this.logger.info(
-          { ...logFields, transactionId: tx.id, kind: tx.kind, status: tx.status, failureCode: tx.failureCode },
-          'wager transaction recorded',
-        );
+        recorded = tx;
         return {
           transactionId: tx.id,
           status: tx.status,
@@ -110,6 +108,15 @@ export class SubmitWagerTransaction {
           idempotentReplay: false,
         } satisfies SubmitResult;
       });
+      // Only after COMMIT: a commit rejected by a deferred constraint must not be counted.
+      const committed = recorded as WagerTransaction | undefined;
+      if (committed) {
+        this.metrics.transactionRecorded(committed.status, committed.kind, ctx.source);
+        this.logger.info(
+          { ...logFields, transactionId: committed.id, kind: committed.kind, status: committed.status, failureCode: committed.failureCode },
+          'wager transaction recorded',
+        );
+      }
       this.metrics.processingDuration((performance.now() - started) / 1000, ctx.source, result.status);
       return result;
     } catch (error) {

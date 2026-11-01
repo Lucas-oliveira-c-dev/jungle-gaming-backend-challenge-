@@ -18,7 +18,8 @@ export interface ReferenceContext {
 export type WagerOutcome =
   | { type: 'processed'; entry?: WalletLedgerEntry; reference?: WagerTransaction }
   | { type: 'rejected'; code: FailureCode }
-  | { type: 'pending_reference' };
+  /** referenceFound: the reference exists but is itself still pending (not "missing"). */
+  | { type: 'pending_reference'; referenceFound: boolean };
 
 /**
  * Applies a wager transaction to its (already locked) wallet. Pure domain logic: it
@@ -48,7 +49,7 @@ export function applyWager(
       reference.status === WagerTransactionStatus.PendingReference
     ) {
       if (tx.status === WagerTransactionStatus.Pending) tx.markPendingReference();
-      return { type: 'pending_reference' };
+      return { type: 'pending_reference', referenceFound: reference !== undefined };
     }
     const code = validateReference(tx, reference, context.alreadyReversed);
     if (code) return reject(code, reference.id);
@@ -85,10 +86,9 @@ function validateReference(
     return FailureCode.ReferenceMismatch;
   }
   if (reference.status !== WagerTransactionStatus.Processed) return FailureCode.ReferenceNotProcessed;
-  if (tx.isReversal()) {
-    if (!reference.money.equals(tx.money)) return FailureCode.ReversalAmountMismatch;
-    if (alreadyReversed) return FailureCode.ReferenceAlreadyReversed;
-  }
+  if (tx.isReversal() && !reference.money.equals(tx.money)) return FailureCode.ReversalAmountMismatch;
+  // A reversed BET is cancelled: it can't be reversed again, nor settled by a WIN/LOSS.
+  if (alreadyReversed) return FailureCode.ReferenceAlreadyReversed;
   return undefined;
 }
 

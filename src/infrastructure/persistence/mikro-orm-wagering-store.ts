@@ -108,13 +108,13 @@ class MikroOrmWageringUnitOfWork implements WageringUnitOfWork {
     });
   }
 
-  async wakePendingDependents(providerId: string, externalTransactionId: string): Promise<number> {
-    // Database clock, like the due query: app instances may be skewed against each other.
+  async wakePendingDependents(walletId: string, providerId: string, externalTransactionId: string): Promise<number> {
+    // Only this (locked) wallet's rows: never lock another wallet's transactions here.
     const rows = await this.em.execute(
       `update wager_transactions set next_reference_check_at = now()
-        where provider_id = ? and reference_external_transaction_id = ? and status = ?
+        where wallet_id = ? and provider_id = ? and reference_external_transaction_id = ? and status = ?
         returning id`,
-      [providerId, externalTransactionId, WagerTransactionStatus.PendingReference],
+      [walletId, providerId, externalTransactionId, WagerTransactionStatus.PendingReference],
     );
     return rows.length;
   }

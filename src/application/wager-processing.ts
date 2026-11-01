@@ -38,12 +38,13 @@ export async function applyAndRecord(
   wallet: Wallet,
   ctx: ProcessingContext,
   ids: IdGenerator,
-  mode: { isNew: boolean; referenceAttempts: number },
-): Promise<WagerOutcome> {
+  /** previousAttempts: reference checks already spent (0 for a new transaction). */
+  mode: { isNew: boolean; previousAttempts: number },
+): Promise<WagerOutcome & { referenceAttempts: number }> {
   const reference = tx.referenceExternalTransactionId
     ? (await uow.findTransactionByExternalId(tx.providerId, tx.referenceExternalTransactionId))?.transaction
     : undefined;
-  const alreadyReversed = reference && tx.isReversal() ? await uow.hasProcessedReversal(reference.id) : false;
+  const alreadyReversed = reference ? await uow.hasProcessedReversal(reference.id) : false;
 
   const outcome = applyWager(tx, wallet, { reference, alreadyReversed }, { ledgerEntryId: ids.next() }, ctx.now);
 
@@ -55,6 +56,7 @@ export async function applyAndRecord(
   });
   const events: IntegrationEvent<unknown>[] = [];
   let schedule: PendingReferenceSchedule | undefined;
+  let attempts = mode.previousAttempts;
 
   switch (outcome.type) {
     case 'processed':
@@ -71,15 +73,18 @@ export async function applyAndRecord(
         events.push(WalletBalanceChanged.from(wallet, outcome.entry, eventCtx()));
       }
       events.push(WagerTransactionProcessed.from(tx, wallet, eventCtx()));
-      await uow.wakePendingDependents(tx.providerId, tx.externalTransactionId);
+      await uow.wakePendingDependents(tx.walletId, tx.providerId, tx.externalTransactionId);
       break;
     case 'rejected':
       events.push(WagerTransactionRejected.from(tx, wallet, eventCtx()));
       // A rejected reference is final too: dependents can now be rejected right away.
-      await uow.wakePendingDependents(tx.providerId, tx.externalTransactionId);
+      await uow.wakePendingDependents(tx.walletId, tx.providerId, tx.externalTransactionId);
       break;
     case 'pending_reference':
-      schedule = { attempts: mode.referenceAttempts, nextCheckAt: nextReferenceCheck(mode.referenceAttempts, ctx.now) };
+      // Only a missing reference consumes the retry budget; one that exists but is itself
+      // still pending will be resolved or rejected on its own schedule, so keep waiting.
+      attempts = mode.isNew || outcome.referenceFound ? mode.previousAttempts : mode.previousAttempts + 1;
+      schedule = { attempts, nextCheckAt: nextReferenceCheck(attempts, ctx.now) };
       if (mode.isNew) events.push(WagerTransactionPendingReference.from(tx, eventCtx()));
       break;
   }
@@ -87,5 +92,5 @@ export async function applyAndRecord(
   if (mode.isNew) await uow.insertTransaction(tx, wallet.balance, schedule);
   else await uow.updateTransaction(tx, wallet.balance, schedule);
   await uow.enqueue(events);
-  return outcome;
+  return { ...outcome, referenceAttempts: attempts };
 }
