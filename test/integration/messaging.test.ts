@@ -71,7 +71,7 @@ describe('atomicity, SQS consumer and transactional outbox', () => {
     expect(wallet).toEqual({ balance: '100.00', version: 1 });
   });
 
-  test('consumer processes a message and acks only after commit', async () => {
+  test('consumer processes a message end to end (ack-after-commit is proven by concurrency scenario 5)', async () => {
     const w = await createWallet(baseUrl(), '100.00');
     const body = wager(w, 'BET', '10.00');
     await sendWagerMessage(t.app.sqs, t.app.queues.transactions, body);
