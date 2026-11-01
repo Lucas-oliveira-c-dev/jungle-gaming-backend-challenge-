@@ -47,7 +47,7 @@ Migration: [`Migration20261031000001_initial.ts`](src/infrastructure/persistence
 |---|---|
 | uma wallet por `playerId + currency` | `unique (player_id, currency)` |
 | saldo nunca negativo | `check (balance >= 0)` em `wallets` e em `balance_before/after` do ledger |
-| idempotência persistente | `unique (idempotency_key)` e `unique (provider_id, external_transaction_id)` |
+| idempotência persistente, isolada por provedor | `unique (provider_id, idempotency_key)` e `unique (provider_id, external_transaction_id)` |
 | no máximo um lançamento por transação/wallet | `unique (wallet_id, transaction_id)` |
 | ledger encadeado e sem buracos por wallet | `sequence` = versão da wallet após o lançamento; `unique (wallet_id, sequence)`; *constraint trigger* no commit: cada lançamento continua o anterior (`sequence + 1` e `balance_before` = `balance_after` anterior), e o primeiro parte de zero |
 | aritmética do lançamento | `check (balance_after = balance_before ± amount)` |
@@ -138,7 +138,7 @@ Por que pessimista e não otimista:
 **Idempotência sob concorrência** (50 requisições iguais em paralelo):
 1. *fast path* sem lock: se a idempotency key já existe, a resposta é um replay;
 2. caso contrário, todas as requisições entram na fila do lock da wallet; a primeira insere a transação, e as demais, já com o lock, encontram a key e devolvem replay;
-3. se a mesma key chegar para **wallets diferentes** (e portanto com locks diferentes), o `unique (idempotency_key)` faz a perdedora dar rollback; ela relê o que a vencedora gravou e responde com replay ou conflito.
+3. se a mesma key chegar para **wallets diferentes** (e portanto com locks diferentes), o `unique (provider_id, idempotency_key)` faz a perdedora dar rollback; ela relê o que a vencedora gravou e responde com replay ou conflito.
 
 FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem por wallet, mas é **só otimização**: os testes enviam mensagens duplicadas com `MessageDeduplicationId` diferentes e misturam HTTP e fila de propósito.
 
@@ -165,6 +165,7 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 ## 8. Idempotência
 
 - A fonte da verdade é o header `Idempotency-Key` (no SQS, `data.idempotencyKey`). O default recomendado é `providerId:externalTransactionId`.
+- **A chave é isolada por provedor** (`unique (provider_id, idempotency_key)`, e toda busca usa os dois). Com uma chave global, um provedor poderia ocupar antes a chave previsível de outro (`providerB:win-123`) e fazer a transação legítima dele falhar como conflito. A autenticação planejada (§14) não evitaria isso, porque ela só vincula o `providerId` do corpo ao token. Esse risco foi apontado na revisão de segurança e corrigido.
 - **`payloadHash`** = `sha256` em hex do **JSON canônico** dos campos de negócio: `providerId`, `externalTransactionId`, `playerId`, `walletId` (UUIDs em minúsculas), `roundId`, `gameId`, `kind`, `money` (`amount` normalizado para 2 casas) e `referenceExternalTransactionId` (omitido quando ausente). JSON canônico aqui significa: chaves ordenadas recursivamente, sem espaços e sem campos `undefined`. Header, `messageId`, `occurredAt` e outros metadados de transporte **não** entram no hash. Assim, `"25"` e `"25.00"` geram o mesmo hash, e a ordem das chaves não importa.
 - Requisição idêntica: a resposta é a original, com `idempotentReplay: true` e **o saldo observado naquele momento** (coluna `result_balance`).
 - Mesma key com payload diferente: `409 IDEMPOTENCY_CONFLICT`. A mesma `(providerId, externalTransactionId)` sob outra key também dá 409.
@@ -235,6 +236,14 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 - **DLQ:** `wagering_dlq_messages_total` conta as mensagens que o consumidor moveu para a DLQ (todos os casos de limite e de erro permanente). As que a `RedrivePolicy` mover como rede de segurança aparecem na profundidade da DLQ, que deve ser monitorada no broker (CloudWatch `ApproximateNumberOfMessagesVisible`).
 - **Reconciliação:** lê saldo e agregados do ledger num mesmo snapshot `REPEATABLE READ` (escritas concorrentes não geram falsa divergência). Verifica a soma do sub-razão, o `balance_after` do último lançamento e o saldo da conta da wallet no razão geral (§3.1). **Nunca corrige nada**: loga em `error`, incrementa a métrica e devolve `consistent: false`.
 
+## 12.1 Retenção
+
+Um worker (de hora em hora, `RETENTION_INTERVAL_MS`) apaga em lotes de 5.000:
+- eventos da outbox **já publicados** há mais de 7 dias (`OUTBOX_RETENTION_DAYS`). Eventos ainda não publicados **nunca** são apagados;
+- registros da inbox com mais de **15 dias** (`INBOX_RETENTION_DAYS`). O prazo é maior que a retenção máxima da SQS (14 dias): enquanto uma mensagem ainda puder ser reentregue, o registro dela continua na inbox. Depois disso, a idempotency key ainda protege contra efeito duplicado.
+
+Carteiras, transações, ledger e razão geral nunca são apagados (são *append-only*, protegidos por triggers).
+
 ## 13. Teste de carga
 
 `bun run test:load` gera tráfego HTTP contra as 3 instâncias do compose. Por padrão: 64 clientes concorrentes, 200 wallets, **20% do tráfego numa única wallet quente**, 70% BET e 30% WIN. Reporta throughput, p50/p95/p99, distribuição de status, taxa de erro, conflitos de lock e lag da outbox, e no fim reconcilia a wallet quente.
@@ -293,7 +302,7 @@ Apple M5 (10 núcleos, 16 GB), macOS 26.6, OrbStack (Docker 29.8). Tudo na mesma
 
 - A wallet quente é serializada pelo lock (correto e previsível, mas o throughput fica limitado a 1 transação por vez naquela wallet). Se isso virar gargalo: *sub-wallets* ou *batching* por wallet.
 - O publisher de outbox usa polling (100–500 ms). `LISTEN/NOTIFY` reduziria a latência.
-- A inbox e a outbox crescem sem limite. Faltam jobs de retenção (particionar por data ou arquivar mensagens publicadas com mais de N dias).
+- Retenção por `DELETE` em lotes é suficiente para o volume do desafio. Em volume de produção, particionar `outbox_messages`/`inbox_messages` por data e descartar partições inteiras seria mais barato.
 - **Pool:** obter uma conexão tem timeout de 5 s (`DB_ACQUIRE_TIMEOUT_MS`). Com o pool esgotado (muitas requisições esperando a mesma wallet quente), as demais falham rápido com 503 em vez de esperar 60 s.
 - **Custos aceitos no caminho quente:** cada movimento faz um `INSERT … ON CONFLICT DO NOTHING` das contas contábeis, e a verificação de balanço do lançamento roda uma vez por partida. São idas extras pequenas, trocadas por garantias no banco. O balancete agrega todas as partidas a cada chamada; em produção, viraria uma visão materializada ou rodaria numa réplica de leitura.
 - O `lock_timeout` é global, por configuração. Em produção valeria ter também um `statement_timeout` e um limite de concorrência por wallet no consumidor.
