@@ -44,8 +44,11 @@ export class Migration20261101000001_double_entry extends Migration {
       create index journal_postings_account on journal_postings (account_code);
     `);
 
-    // ---- backfill from the existing wallet sub-ledger
+    // ---- backfill from the existing wallet sub-ledger. The lock blocks concurrent ledger
+    // writes until this migration commits, so no movement can slip between the backfill
+    // snapshot and the trigger below. (Deploy note: run migrations before new instances.)
     this.addSql(`
+      lock table wallet_ledger_entries in share row exclusive mode;
       insert into accounts (code, type, currency, created_at)
       select distinct 'wallet:' || l.wallet_id, 'LIABILITY', l.currency, now() from wallet_ledger_entries l
       union

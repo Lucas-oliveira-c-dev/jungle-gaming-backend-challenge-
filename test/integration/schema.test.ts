@@ -50,6 +50,13 @@ describe('migrations and constraints', () => {
     });
   });
 
+  /** Raw SQL for a wager transaction row on the fixture wallet. */
+  function newTransaction(id: string, kind = 'BET', amount = '5.00'): string {
+    return `insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
+      round_id, game_id, kind, amount, currency, status, created_at, processed_at) values ('${id}', 'p', '${id}', '${id}', '${'f'.repeat(64)}',
+      '${walletId}', '${playerId}', 'r', 'g', '${kind}', ${amount}, 'BRL', 'PROCESSED', now(), now())`;
+  }
+
   /** Raw SQL for a two-posting journal entry: debit one account, credit the other. */
   function journal(transactionId: string, debit: string, credit: string, amount: string, creditAmount = amount): string[] {
     const entry = crypto.randomUUID();
@@ -61,16 +68,6 @@ describe('migrations and constraints', () => {
   }
 
   afterAll(async () => orm?.close());
-
-  test('migrations are reversible (down to zero and up again)', async () => {
-    const tmp = await initOrm({ databaseUrl: TEST_DATABASE_URL, dbPoolMax: 1 });
-    try {
-      const executed = await tmp.getMigrator().getExecutedMigrations();
-      expect(executed.map((m) => m.name)).toContain('Migration20261031000001_initial');
-    } finally {
-      await tmp.close();
-    }
-  });
 
   test('balance cannot be negative', async () => {
     await expectSqlError([`update wallets set balance = -1 where id = '${walletId}'`], /check constraint/);
@@ -88,9 +85,35 @@ describe('migrations and constraints', () => {
   });
 
   test('ledger arithmetic must balance', async () => {
+    const tx = crypto.randomUUID();
     await expectSqlError(
-      [`insert into wallet_ledger_entries values ('${crypto.randomUUID()}', '${walletId}', '${txId}', 9, 'DEBIT', 10, 'BRL', 75, 70, now())`],
-      /ledger_balanced|ledger_one_entry_per_tx/,
+      [newTransaction(tx), `insert into wallet_ledger_entries values ('${crypto.randomUUID()}', '${walletId}', '${tx}', 3, 'DEBIT', 10, 'BRL', 75, 70, now())`],
+      /ledger_balanced/,
+    );
+  });
+
+  test('ledger is a gap-free chain: balance_before must continue the previous entry', async () => {
+    const tx = crypto.randomUUID();
+    await expectSqlError(
+      [
+        newTransaction(tx),
+        `update wallets set balance = 65.00, version = 3 where id = '${walletId}'`,
+        `insert into wallet_ledger_entries values ('${crypto.randomUUID()}', '${walletId}', '${tx}', 3, 'DEBIT', 5.00, 'BRL', 70.00, 65.00, now())`,
+        ...journal(tx, `wallet:${walletId}`, 'provider:p:BRL', '5.00'),
+      ],
+      /breaks the chain/,
+    );
+  });
+
+  test('ledger without balance: an entry the wallet does not reflect fails at commit', async () => {
+    const tx = crypto.randomUUID();
+    await expectSqlError(
+      [
+        newTransaction(tx),
+        `insert into wallet_ledger_entries values ('${crypto.randomUUID()}', '${walletId}', '${tx}', 3, 'DEBIT', 5.00, 'BRL', 75.00, 70.00, now())`,
+        ...journal(tx, `wallet:${walletId}`, 'provider:p:BRL', '5.00'),
+      ],
+      /is at version 2 but its ledger ends at sequence 3/,
     );
   });
 
@@ -157,6 +180,11 @@ describe('migrations and constraints', () => {
     );
   });
 
+  test('double entry: a posting on a wallet account without a wallet movement is rejected', async () => {
+    const tx = crypto.randomUUID();
+    await expectSqlError([newTransaction(tx, 'LOSS', '0'), ...journal(tx, 'house:funding:BRL', `wallet:${walletId}`, '50.00')], /no matching wallet ledger entry/);
+  });
+
   test('double entry: journal and accounts are append-only', async () => {
     await expectSqlError([`update journal_postings set amount = 1`], /append-only/);
     await expectSqlError([`delete from journal_entries`], /append-only/);
@@ -169,8 +197,15 @@ describe('migrations and constraints', () => {
     expect(row?.net).toBe('0.00');
   });
 
-  test('money columns keep exact decimals', async () => {
-    const [row] = await sql<{ v: string }>(orm, `select (0.1::numeric(20,2) + 0.2::numeric(20,2))::text as v`);
-    expect(row?.v).toBe('0.30');
+  // Last on purpose: it drops and recreates the schema, populated fixture included.
+  test('migrations are reversible: down to zero on a populated database, then up again', async () => {
+    const migrator = orm.getMigrator();
+    const all = ['Migration20261031000001_initial', 'Migration20261101000001_double_entry', 'Migration20261101000002_ledger_integrity'];
+    expect((await migrator.getExecutedMigrations()).map((m) => m.name)).toEqual(all);
+    await migrator.down({ to: 0 });
+    const [gone] = await sql<{ n: string }>(orm, `select count(*)::text as n from pg_tables where schemaname = 'public' and tablename <> 'mikro_orm_migrations'`);
+    expect(gone?.n).toBe('0');
+    await migrator.up();
+    expect((await migrator.getExecutedMigrations()).map((m) => m.name)).toEqual(all);
   });
 });
