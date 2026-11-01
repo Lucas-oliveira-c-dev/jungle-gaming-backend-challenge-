@@ -120,7 +120,7 @@ export class WageringController {
   }
 
   @Get('ledger/trial-balance')
-  trialBalance(@Query('currency') currency?: string) {
+  trialBalance(@Query('currency') currency?: unknown) {
     return this.queries.trialBalance(currency);
   }
 

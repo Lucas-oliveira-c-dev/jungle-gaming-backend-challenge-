@@ -1,4 +1,5 @@
 import type { WalletLedgerEntry } from '../domain/ledger-entry';
+import { AccountType } from '../domain/journal';
 import { Money, type MoneyProps } from '../domain/money';
 import type { Wallet } from '../domain/wallet';
 import { walletView, type WalletView } from './create-wallet';
@@ -179,9 +180,10 @@ export class WageringQueries {
   }
 
   /** Debits and credits per account; a correct double-entry ledger always nets to zero. */
-  async trialBalance(rawCurrency: string | undefined) {
-    const currency = (rawCurrency ?? 'BRL').toUpperCase();
-    if (!/^[A-Z]{3}$/.test(currency)) throw new ValidationError('currency must be an ISO-4217 code');
+  async trialBalance(rawCurrency: unknown) {
+    // Query strings can arrive as arrays (?currency=A&currency=B): validate before use.
+    const currency = rawCurrency === undefined ? 'BRL' : typeof rawCurrency === 'string' ? rawCurrency.toUpperCase() : '';
+    if (!/^[A-Z]{3}$/.test(currency)) throw new ValidationError('currency must be a single ISO-4217 code');
     const rows = await this.read.trialBalance(currency);
     const money = (amount: string) => Money.from({ amount, currency });
     const totalDebits = rows.reduce((sum, r) => sum.add(money(r.debits)), Money.zero(currency));
@@ -195,7 +197,7 @@ export class WageringQueries {
         debits: money(r.debits).toJSON(),
         credits: money(r.credits).toJSON(),
         // Natural balance: assets are debit-normal, liabilities credit-normal.
-        balance: (r.type === 'ASSET' ? money(r.debits).subtract(money(r.credits)) : money(r.credits).subtract(money(r.debits))).toJSON(),
+        balance: (r.type === AccountType.Asset ? money(r.debits).subtract(money(r.credits)) : money(r.credits).subtract(money(r.debits))).toJSON(),
       })),
       totalDebits: totalDebits.toJSON(),
       totalCredits: totalCredits.toJSON(),

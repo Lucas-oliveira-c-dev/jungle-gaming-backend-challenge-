@@ -2,6 +2,7 @@ import { IsolationLevel, type MikroORM } from '@mikro-orm/postgresql';
 import type { StoredTransaction } from '../../application/ports';
 import type { TrialBalanceRow, WageringReadModel } from '../../application/queries';
 import type { WalletLedgerEntry } from '../../domain/ledger-entry';
+import { Accounts } from '../../domain/journal';
 import type { Wallet } from '../../domain/wallet';
 import { ledgerEntryToDomain, toStoredTransaction, walletToDomain } from './mappers';
 import { LedgerEntryRecord, WagerTransactionRecord, WalletRecord } from './records';
@@ -49,7 +50,7 @@ export class MikroOrmReadModel implements WageringReadModel {
         const [general] = await em.execute<{ balance: string }[]>(
           `select coalesce(sum(case direction when 'CREDIT' then amount else -amount end), 0)::numeric(20,2)::text as balance
              from journal_postings where account_code = ?`,
-          [`wallet:${walletId}`],
+          [Accounts.wallet(walletId, record.currency.trim()).code],
         );
         const signed = aggregate?.signed_sum ?? '0';
         return {
