@@ -57,7 +57,7 @@ export class CreateWallet {
     const openingId = this.ids.next();
     const { wallet, openingEntry } = Wallet.open({
       id: walletId,
-      playerId: parsed.data.playerId,
+      playerId: parsed.data.playerId.toLowerCase(),
       initialBalance,
       opening: { transactionId: openingId, entryId: this.ids.next() },
       at: now,

@@ -70,8 +70,19 @@ export function parseWagerSubmission(body: unknown, idempotencyKey: unknown): Va
   if (kind === WagerTransactionKind.Bet && data.referenceExternalTransactionId) {
     throw new ValidationError('BET cannot reference another transaction');
   }
+  if (data.referenceExternalTransactionId === data.externalTransactionId) {
+    throw new ValidationError('A transaction cannot reference itself');
+  }
 
-  const request: WagerRequest = { ...data, kind, money };
+  // UUIDs are case-insensitive; Postgres returns them lowercase, so normalize once here
+  // or comparisons in the domain would reject valid uppercase ids.
+  const request: WagerRequest = {
+    ...data,
+    playerId: data.playerId.toLowerCase(),
+    walletId: data.walletId.toLowerCase(),
+    kind,
+    money,
+  };
   return { request, idempotencyKey: idempotencyKey.trim(), payloadHash: payloadHash(request) };
 }
 
@@ -84,8 +95,8 @@ export function payloadHash(request: WagerRequest): string {
   const business = {
     providerId: request.providerId,
     externalTransactionId: request.externalTransactionId,
-    playerId: request.playerId.toLowerCase(),
-    walletId: request.walletId.toLowerCase(),
+    playerId: request.playerId,
+    walletId: request.walletId,
     roundId: request.roundId,
     gameId: request.gameId,
     kind: request.kind,

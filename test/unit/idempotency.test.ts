@@ -51,6 +51,7 @@ describe('request validation', () => {
     ['refund without reference', body({ kind: 'REFUND' }), 'k'],
     ['unknown field', body({ extra: true }), 'k'],
     ['invalid uuid', body({ walletId: 'nope' }), 'k'],
+    ['self reference', body({ kind: 'REFUND', referenceExternalTransactionId: 'transaction-123' }), 'k'],
   ])('%s', (_name, payload, key) => {
     expect(() => parseWagerSubmission(payload, key)).toThrow(ValidationError);
   });
@@ -103,6 +104,14 @@ describe('SubmitWagerTransaction idempotency', () => {
     const first = await submit.execute(big, ctx);
     expect(first).toMatchObject({ status: 'REJECTED', failureCode: 'INSUFFICIENT_FUNDS' });
     expect(await submit.execute(big, ctx)).toMatchObject({ status: 'REJECTED', failureCode: 'INSUFFICIENT_FUNDS', idempotentReplay: true });
+  });
+
+  test('uppercase UUIDs are the same ids (no false PLAYER_WALLET_MISMATCH)', async () => {
+    const upper = body({ playerId: playerId.toUpperCase(), walletId: walletId.toUpperCase() });
+    const result = await submit.execute(parseWagerSubmission(upper, 'k-upper'), ctx);
+    expect(result).toMatchObject({ status: 'PROCESSED', balance: { amount: '975.00' } });
+    // same business payload regardless of casing
+    expect(parseWagerSubmission(upper, 'x').payloadHash).toBe(parseWagerSubmission(body(), 'x').payloadHash);
   });
 
   test('SQS redelivery of the same messageId is deduplicated by the inbox', async () => {
