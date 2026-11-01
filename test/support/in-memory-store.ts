@@ -7,6 +7,7 @@ import type {
   WageringUnitOfWork,
 } from '../../src/application/ports';
 import type { IntegrationEvent } from '../../src/domain/events';
+import type { JournalEntry } from '../../src/domain/journal';
 import type { WalletLedgerEntry } from '../../src/domain/ledger-entry';
 import type { InboxMessage } from '../../src/domain/messaging';
 import type { Money } from '../../src/domain/money';
@@ -21,6 +22,7 @@ export class InMemoryStore implements WageringStore {
   wallets = new Map<string, Wallet>();
   transactions = new Map<string, StoredTransaction>();
   ledger: WalletLedgerEntry[] = [];
+  journal: JournalEntry[] = [];
   outbox: IntegrationEvent<unknown>[] = [];
   inbox = new Set<string>();
 
@@ -68,8 +70,9 @@ export class InMemoryStore implements WageringStore {
         store.transactions.set(tx.id, { transaction: tx, resultBalance, referenceAttempts: schedule?.attempts ?? 0 });
       },
       wakePendingDependents: async () => 0,
-      async insertLedgerEntry(e) {
+      async recordMovement(e, journal) {
         store.ledger.push(e);
+        store.journal.push(journal);
       },
       async enqueue(events) {
         store.outbox.push(...events);

@@ -119,6 +119,11 @@ export class WageringController {
     return this.queries.transaction(transactionId);
   }
 
+  @Get('ledger/trial-balance')
+  trialBalance(@Query('currency') currency?: string) {
+    return this.queries.trialBalance(currency);
+  }
+
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
   byExternalId(@Param('providerId') providerId: string, @Param('externalTransactionId') externalTransactionId: string) {
     return this.queries.transactionByExternalId(providerId, externalTransactionId);

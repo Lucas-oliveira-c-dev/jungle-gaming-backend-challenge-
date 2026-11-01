@@ -1,4 +1,5 @@
 import type { IntegrationEvent } from '../domain/events';
+import type { JournalEntry } from '../domain/journal';
 import type { WalletLedgerEntry } from '../domain/ledger-entry';
 import type { InboxMessage, OutboxMessage } from '../domain/messaging';
 import type { Money } from '../domain/money';
@@ -36,7 +37,11 @@ export interface WageringUnitOfWork {
   /** Makes transactions waiting for (providerId, externalTransactionId) due immediately. */
   wakePendingDependents(providerId: string, externalTransactionId: string): Promise<number>;
 
-  insertLedgerEntry(entry: WalletLedgerEntry): Promise<void>;
+  /**
+   * Writes a wallet sub-ledger entry together with its double-entry journal entry —
+   * there is no way to record one without the other.
+   */
+  recordMovement(entry: WalletLedgerEntry, journal: JournalEntry): Promise<void>;
   enqueue(events: IntegrationEvent<unknown>[]): Promise<void>;
   /** Returns false when (consumer, messageId) was already recorded — i.e. a redelivery. */
   registerInbox(message: InboxMessage): Promise<boolean>;
@@ -49,7 +54,8 @@ export interface WageringStore {
   isLockConflict(error: unknown): boolean;
   /** Non-locking read used for the idempotency fast path. */
   findTransactionByIdempotencyKey(key: string): Promise<StoredTransaction | null>;
-  findDuePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]>;
+  /** Due according to the database clock (shared by all instances, immune to app clock skew). */
+  findDuePendingReferences(limit: number): Promise<{ id: string; walletId: string }[]>;
 }
 
 export interface OutboxStore {

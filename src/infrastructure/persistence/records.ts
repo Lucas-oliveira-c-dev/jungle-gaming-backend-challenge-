@@ -142,4 +142,45 @@ export const OutboxSchema = new EntitySchema<OutboxRecord>({
   },
 });
 
-export const ENTITY_SCHEMAS = [WalletSchema, WagerTransactionSchema, LedgerEntrySchema, OutboxSchema];
+
+export class JournalEntryRecord {
+  id!: string;
+  transactionId!: string;
+  createdAt!: Date;
+}
+
+export const JournalEntrySchema = new EntitySchema<JournalEntryRecord>({
+  class: JournalEntryRecord,
+  tableName: 'journal_entries',
+  properties: {
+    id: { type: 'uuid', primary: true },
+    transactionId: { type: 'uuid' },
+    createdAt: { type: 'datetime', columnType: 'timestamptz' },
+  },
+});
+
+export class JournalPostingRecord {
+  id!: string;
+  journalEntryId!: string;
+  accountCode!: string;
+  direction!: string;
+  amount!: string;
+  currency!: string;
+  createdAt!: Date;
+}
+
+export const JournalPostingSchema = new EntitySchema<JournalPostingRecord>({
+  class: JournalPostingRecord,
+  tableName: 'journal_postings',
+  properties: {
+    id: { type: 'uuid', primary: true },
+    journalEntryId: { type: 'uuid' },
+    accountCode: { type: 'text' },
+    direction: { type: 'text' },
+    amount: { type: 'decimal', columnType: 'numeric(20,2)' },
+    currency: { type: 'string', columnType: 'char(3)' },
+    createdAt: { type: 'datetime', columnType: 'timestamptz' },
+  },
+});
+
+export const ENTITY_SCHEMAS = [WalletSchema, WagerTransactionSchema, LedgerEntrySchema, OutboxSchema, JournalEntrySchema, JournalPostingSchema];

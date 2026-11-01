@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { InvalidMoneyError } from '../domain/errors';
 import { WagerTransactionProcessed, WalletBalanceChanged, type IntegrationEvent } from '../domain/events';
+import { Accounts, JournalEntry } from '../domain/journal';
 import { Money } from '../domain/money';
 import { WagerTransaction, WagerTransactionKind } from '../domain/wager-transaction';
 import { Wallet } from '../domain/wallet';
@@ -85,7 +86,10 @@ export class CreateWallet {
         });
         opening.markProcessed(undefined, now);
         await uow.insertTransaction(opening, wallet.balance);
-        await uow.insertLedgerEntry(openingEntry);
+        await uow.recordMovement(
+          openingEntry,
+          JournalEntry.forWalletMovement({ id: this.ids.next(), entry: openingEntry, counterparty: Accounts.houseFunding(initialBalance.currency) }),
+        );
         const eventCtx = () => ({ eventId: this.ids.next(), correlationId: ctx.correlationId, occurredAt: now });
         const events: IntegrationEvent<unknown>[] = [
           WalletBalanceChanged.from(wallet, openingEntry, eventCtx()),

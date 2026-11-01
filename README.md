@@ -66,6 +66,7 @@ aws --endpoint-url http://localhost:4566 sqs send-message \
 curl -s localhost:3003/wallets/WALLET_ID
 curl -s 'localhost:3003/wallets/WALLET_ID/ledger?limit=50'
 curl -s -X POST localhost:3003/wallets/WALLET_ID/reconciliation
+curl -s 'localhost:3003/ledger/trial-balance?currency=BRL'
 curl -s localhost:3001/providers/provider-a/wagering/transactions/transaction-123
 curl -s localhost:3001/health/ready
 curl -s localhost:3001/metrics
@@ -78,7 +79,8 @@ curl -s localhost:3001/metrics
 | `POST /wallets` | cria wallet (+ transação `OPENING` e lançamento `CREDIT` se saldo > 0) |
 | `GET /wallets/:walletId` | wallet |
 | `GET /wallets/:walletId/ledger?cursor=&limit=` | ledger paginado por cursor opaco e estável |
-| `POST /wallets/:walletId/reconciliation` | saldo materializado × saldo reconstruído pelo ledger |
+| `POST /wallets/:walletId/reconciliation` | saldo materializado × saldo reconstruído pelo ledger e pelo razão geral |
+| `GET /ledger/trial-balance?currency=BRL` | balancete do ledger de partidas dobradas (débitos = créditos) |
 | `POST /wagering/transactions` | submete transação (header `Idempotency-Key` obrigatório) |
 | `GET /wagering/transactions/:transactionId` | por id interno |
 | `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | por id do provedor |
@@ -128,7 +130,7 @@ Reporta throughput, p50/p95/p99, taxa de erro, conflitos de lock, lag da outbox 
 
 ```
 src/
-  domain/            Money, Wallet, WagerTransaction, WalletLedgerEntry, Inbox/Outbox, eventos, política de apostas
+  domain/            Money, Wallet, WagerTransaction, WalletLedgerEntry, JournalEntry (partidas dobradas), Inbox/Outbox, eventos, política de apostas
   application/       casos de uso (submit, create wallet, queries, reconciliação, outbox, referências pendentes) + portas
   infrastructure/
     persistence/     MikroORM (EntitySchema), migrations, repositórios/unit of work, outbox store

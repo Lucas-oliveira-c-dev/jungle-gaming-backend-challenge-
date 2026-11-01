@@ -51,7 +51,7 @@ describe('atomicity, SQS consumer and transactional outbox', () => {
         real.transactional((uow) =>
           work(
             Object.assign(Object.create(uow), {
-              insertLedgerEntry: uow.insertLedgerEntry.bind(uow),
+              recordMovement: uow.recordMovement.bind(uow),
               enqueue: async () => {
                 throw new Error('boom: outbox unavailable');
               },

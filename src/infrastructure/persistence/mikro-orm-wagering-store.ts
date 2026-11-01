@@ -6,6 +6,7 @@ import type {
   WageringUnitOfWork,
 } from '../../application/ports';
 import type { IntegrationEvent } from '../../domain/events';
+import type { JournalEntry } from '../../domain/journal';
 import type { WalletLedgerEntry } from '../../domain/ledger-entry';
 import type { Money } from '../../domain/money';
 import { OutboxMessage, type InboxMessage } from '../../domain/messaging';
@@ -21,8 +22,14 @@ import {
   walletToRecordData,
   toStoredTransaction,
 } from './mappers';
-import { LedgerEntryRecord, OutboxRecord, WagerTransactionRecord, WalletRecord } from './records';
-
+import {
+  JournalEntryRecord,
+  JournalPostingRecord,
+  LedgerEntryRecord,
+  OutboxRecord,
+  WagerTransactionRecord,
+  WalletRecord,
+} from './records';
 
 /**
  * Unit of Work bound to one forked EntityManager inside `em.transactional()`.
@@ -95,15 +102,41 @@ class MikroOrmWageringUnitOfWork implements WageringUnitOfWork {
   }
 
   async wakePendingDependents(providerId: string, externalTransactionId: string): Promise<number> {
-    return this.em.nativeUpdate(
-      WagerTransactionRecord,
-      { providerId, referenceExternalTransactionId: externalTransactionId, status: WagerTransactionStatus.PendingReference },
-      { nextReferenceCheckAt: new Date() },
+    // Database clock, like the due query: app instances may be skewed against each other.
+    const rows = await this.em.execute(
+      `update wager_transactions set next_reference_check_at = now()
+        where provider_id = ? and reference_external_transaction_id = ? and status = ?
+        returning id`,
+      [providerId, externalTransactionId, WagerTransactionStatus.PendingReference],
     );
+    return rows.length;
   }
 
-  async insertLedgerEntry(entry: WalletLedgerEntry): Promise<void> {
+  async recordMovement(entry: WalletLedgerEntry, journal: JournalEntry): Promise<void> {
     this.em.persist(this.em.create(LedgerEntryRecord, ledgerEntryToRecordData(entry)));
+
+    // Accounts are created on first use; an existing account costs no lock (DO NOTHING).
+    const accounts = journal.postings.map((p) => p.account);
+    await this.em.execute(
+      `insert into accounts (code, type, currency, created_at)
+       values ${accounts.map(() => '(?, ?, ?, now())').join(', ')}
+       on conflict (code) do nothing`,
+      accounts.flatMap((a) => [a.code, a.type, a.currency]),
+    );
+    this.em.persist(this.em.create(JournalEntryRecord, { id: journal.id, transactionId: journal.transactionId, createdAt: journal.createdAt }));
+    for (const posting of journal.postings) {
+      this.em.persist(
+        this.em.create(JournalPostingRecord, {
+          id: Bun.randomUUIDv7(),
+          journalEntryId: journal.id,
+          accountCode: posting.account.code,
+          direction: posting.direction,
+          amount: posting.money.toString(),
+          currency: posting.money.currency,
+          createdAt: journal.createdAt,
+        }),
+      );
+    }
   }
 
   async enqueue(events: IntegrationEvent<unknown>[]): Promise<void> {
@@ -171,12 +204,14 @@ export class MikroOrmWageringStore implements WageringStore {
     return record ? toStoredTransaction(record) : null;
   }
 
-  async findDuePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]> {
-    const records = await this.orm.em.fork().find(
-      WagerTransactionRecord,
-      { status: WagerTransactionStatus.PendingReference, nextReferenceCheckAt: { $lte: now } },
-      { orderBy: { nextReferenceCheckAt: 'asc' }, limit, fields: ['id', 'walletId'] },
+  /** "Due" is decided by the database clock, the single clock shared by every instance. */
+  async findDuePendingReferences(limit: number): Promise<{ id: string; walletId: string }[]> {
+    return this.orm.em.fork().execute<{ id: string; walletId: string }[]>(
+      `select id, wallet_id as "walletId" from wager_transactions
+        where status = ? and next_reference_check_at <= now()
+        order by next_reference_check_at
+        limit ?`,
+      [WagerTransactionStatus.PendingReference, limit],
     );
-    return records.map((r) => ({ id: r.id, walletId: r.walletId }));
   }
 }

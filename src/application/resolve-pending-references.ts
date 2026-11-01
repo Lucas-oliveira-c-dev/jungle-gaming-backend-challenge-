@@ -21,7 +21,7 @@ export class ResolvePendingReferences {
 
   /** Returns how many transactions left PENDING_REFERENCE in this run. */
   async runOnce(batchSize = 50): Promise<number> {
-    const due = await this.store.findDuePendingReferences(this.clock.now(), batchSize);
+    const due = await this.store.findDuePendingReferences(batchSize);
     let resolved = 0;
     for (const candidate of due) {
       try {

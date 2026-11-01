@@ -42,8 +42,23 @@ describe('migrations and constraints', () => {
         round_id, game_id, kind, amount, currency, status, created_at, processed_at, result_balance)
         values ('${txId}', 'p', 'e1', 'p:e1', '${'a'.repeat(64)}', '${walletId}', '${playerId}', 'r', 'g', 'BET', 25.00, 'BRL', 'PROCESSED', now(), now(), 75.00)`);
       await em.execute(`insert into wallet_ledger_entries values ('${crypto.randomUUID()}', '${walletId}', '${txId}', 2, 'DEBIT', 25.00, 'BRL', 100.00, 75.00, now())`);
+      // Double-entry counterparts: opening funded by the house, bet settled with provider p.
+      await em.execute(`insert into accounts values ('wallet:${walletId}', 'LIABILITY', 'BRL', now()),
+        ('house:funding:BRL', 'ASSET', 'BRL', now()), ('provider:p:BRL', 'LIABILITY', 'BRL', now()) on conflict do nothing`);
+      for (const statement of journal(openingId, 'house:funding:BRL', `wallet:${walletId}`, '100.00')) await em.execute(statement);
+      for (const statement of journal(txId, `wallet:${walletId}`, 'provider:p:BRL', '25.00')) await em.execute(statement);
     });
   });
+
+  /** Raw SQL for a two-posting journal entry: debit one account, credit the other. */
+  function journal(transactionId: string, debit: string, credit: string, amount: string, creditAmount = amount): string[] {
+    const entry = crypto.randomUUID();
+    return [
+      `insert into journal_entries values ('${entry}', '${transactionId}', now())`,
+      `insert into journal_postings values ('${crypto.randomUUID()}', '${entry}', '${debit}', 'DEBIT', ${amount}, 'BRL', now()),
+        ('${crypto.randomUUID()}', '${entry}', '${credit}', 'CREDIT', ${creditAmount}, 'BRL', now())`,
+    ];
+  }
 
   afterAll(async () => orm?.close());
 
@@ -113,6 +128,45 @@ describe('migrations and constraints', () => {
         'r', 'g', '${kind}', 25, 'BRL', ${ref ? `'e1'` : 'null'}, ${ref ? `'${ref}'` : 'null'}, 'PROCESSED', now(), now())`;
     await expectSqlError([reversal('REFUND', null)], /wager_tx_reversal_needs_reference/);
     await expectSqlError([reversal('REFUND', txId), reversal('ROLLBACK', txId)], /wager_tx_one_reversal_per_reference/);
+  });
+
+  test('double entry: a journal entry must balance (checked at commit)', async () => {
+    const tx = crypto.randomUUID();
+    await expectSqlError(
+      [
+        `insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
+          round_id, game_id, kind, amount, currency, status, created_at) values ('${tx}', 'p', '${tx}', '${tx}', '${'d'.repeat(64)}',
+          '${walletId}', '${playerId}', 'r', 'g', 'LOSS', 0, 'BRL', 'PENDING', now())`,
+        ...journal(tx, 'provider:p:BRL', `wallet:${walletId}`, '10.00', '9.99'),
+      ],
+      /journal entry .* is unbalanced/,
+    );
+  });
+
+  test('double entry: a wallet movement without its journal posting is rejected at commit', async () => {
+    const tx = crypto.randomUUID();
+    await expectSqlError(
+      [
+        `insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
+          round_id, game_id, kind, amount, currency, status, created_at, processed_at) values ('${tx}', 'p', '${tx}', '${tx}', '${'e'.repeat(64)}',
+          '${walletId}', '${playerId}', 'r', 'g', 'BET', 5, 'BRL', 'PROCESSED', now(), now())`,
+        `update wallets set balance = 70.00, version = 3 where id = '${walletId}'`,
+        `insert into wallet_ledger_entries values ('${crypto.randomUUID()}', '${walletId}', '${tx}', 3, 'DEBIT', 5.00, 'BRL', 75.00, 70.00, now())`,
+      ],
+      /has no matching journal posting/,
+    );
+  });
+
+  test('double entry: journal and accounts are append-only', async () => {
+    await expectSqlError([`update journal_postings set amount = 1`], /append-only/);
+    await expectSqlError([`delete from journal_entries`], /append-only/);
+    await expectSqlError([`truncate journal_postings cascade`], /append-only/);
+    await expectSqlError([`update accounts set type = 'ASSET'`], /append-only/);
+  });
+
+  test('double entry: the seeded ledger nets to zero', async () => {
+    const [row] = await sql<{ net: string }>(orm, `select sum(case direction when 'DEBIT' then amount else -amount end)::text as net from journal_postings`);
+    expect(row?.net).toBe('0.00');
   });
 
   test('money columns keep exact decimals', async () => {

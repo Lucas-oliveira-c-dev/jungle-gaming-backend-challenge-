@@ -20,7 +20,18 @@ export interface WageringReadModel {
     signedSum: string;
     entries: number;
     lastBalanceAfter?: string;
+    /** Balance of the wallet account in the double-entry general ledger. */
+    generalLedgerBalance: string;
   } | null>;
+  trialBalance(currency: string): Promise<TrialBalanceRow[]>;
+}
+
+export interface TrialBalanceRow {
+  account: string;
+  type: string;
+  accounts: number;
+  debits: string;
+  credits: string;
 }
 
 export interface TransactionView {
@@ -146,11 +157,13 @@ export class WageringQueries {
       snapshot.lastBalanceAfter === undefined
         ? stored.isZero()
         : Money.from({ amount: snapshot.lastBalanceAfter, currency: wallet.currency }).equals(stored);
-    const consistent = difference.isZero() && chainOk;
+    const generalLedger = Money.fromSigned({ amount: snapshot.generalLedgerBalance, currency: wallet.currency });
+    const generalLedgerOk = generalLedger.equals(stored);
+    const consistent = difference.isZero() && chainOk && generalLedgerOk;
     if (!consistent) {
       this.metrics.reconciliationDivergence(walletId);
       this.logger.error(
-        { correlationId: ctx.correlationId, walletId, difference: difference.toString(), chainOk },
+        { correlationId: ctx.correlationId, walletId, difference: difference.toString(), chainOk, generalLedgerOk },
         'wallet reconciliation divergence',
       );
     }
@@ -161,6 +174,32 @@ export class WageringQueries {
       difference: difference.toJSON(),
       consistent,
       checkedEntries: snapshot.entries,
+      generalLedgerBalance: generalLedger.toJSON(),
+    };
+  }
+
+  /** Debits and credits per account; a correct double-entry ledger always nets to zero. */
+  async trialBalance(rawCurrency: string | undefined) {
+    const currency = (rawCurrency ?? 'BRL').toUpperCase();
+    if (!/^[A-Z]{3}$/.test(currency)) throw new ValidationError('currency must be an ISO-4217 code');
+    const rows = await this.read.trialBalance(currency);
+    const money = (amount: string) => Money.from({ amount, currency });
+    const totalDebits = rows.reduce((sum, r) => sum.add(money(r.debits)), Money.zero(currency));
+    const totalCredits = rows.reduce((sum, r) => sum.add(money(r.credits)), Money.zero(currency));
+    return {
+      currency,
+      accounts: rows.map((r) => ({
+        account: r.account,
+        type: r.type,
+        accounts: r.accounts,
+        debits: money(r.debits).toJSON(),
+        credits: money(r.credits).toJSON(),
+        // Natural balance: assets are debit-normal, liabilities credit-normal.
+        balance: (r.type === 'ASSET' ? money(r.debits).subtract(money(r.credits)) : money(r.credits).subtract(money(r.debits))).toJSON(),
+      })),
+      totalDebits: totalDebits.toJSON(),
+      totalCredits: totalCredits.toJSON(),
+      balanced: totalDebits.equals(totalCredits),
     };
   }
 }

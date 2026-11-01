@@ -125,7 +125,37 @@ describe('HTTP API', () => {
       difference: { amount: '0.00', currency: 'BRL' },
       consistent: true,
       checkedEntries: 6,
+      generalLedgerBalance: { amount: '90.00', currency: 'BRL' },
     });
+
+    // Double entry: every movement of this round has its journal entry, and they all balance.
+    const journal = await sql<{ entries: string; net: string }>(
+      t.app.orm,
+      `select count(distinct j.id)::text as entries, sum(case p.direction when 'DEBIT' then p.amount else -p.amount end)::text as net
+         from journal_entries j join journal_postings p on p.journal_entry_id = j.id
+         join wager_transactions tx on tx.id = j.transaction_id where tx.wallet_id = ?`,
+      [w.walletId],
+    );
+    expect(journal[0]).toEqual({ entries: '6', net: '0.00' });
+  });
+
+  test('trial balance: total debits equal total credits, per account group', async () => {
+    const w = await createWallet(t.baseUrl, '50.00');
+    await submit(t.baseUrl, wager(w, 'BET', '20.00', { providerId: 'provider-tb' }));
+    await submit(t.baseUrl, wager(w, 'WIN', '35.00', { providerId: 'provider-tb' }));
+
+    const res = await api(t.baseUrl, 'GET', '/ledger/trial-balance?currency=BRL');
+    expect(res.status).toBe(200);
+    expect(res.body.balanced).toBe(true);
+    expect(res.body.totalDebits).toEqual(res.body.totalCredits);
+    const provider = res.body.accounts.find((a: { account: string }) => a.account === 'provider:provider-tb:BRL');
+    // Provider settlement: credited by the bet (20), debited by the win (35) -> owes us 15.
+    expect(provider).toMatchObject({ type: 'LIABILITY', debits: { amount: '35.00' }, credits: { amount: '20.00' }, balance: { amount: '-15.00' } });
+    const wallets = res.body.accounts.find((a: { account: string }) => a.account === 'wallet:*');
+    const funding = res.body.accounts.find((a: { account: string }) => a.account === 'house:funding:BRL');
+    expect(wallets.type).toBe('LIABILITY');
+    expect(funding.type).toBe('ASSET');
+    expect((await api(t.baseUrl, 'GET', '/ledger/trial-balance?currency=brl1')).status).toBe(400);
   });
 
   test('currency conflict is rejected and auditable', async () => {

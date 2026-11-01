@@ -63,6 +63,42 @@ Migration: [`Migration20261031000001_initial.ts`](src/infrastructure/persistence
 
 As FKs são `DEFERRABLE INITIALLY DEFERRED`. Assim, a ordem dos INSERTs gerada pelo Unit of Work do MikroORM não importa: tudo é verificado no commit.
 
+## 3.1 Ledger de partidas dobradas
+
+Além do ledger por wallet (o sub-razão, com `balance_before`/`balance_after` e sequência sem buracos), existe um **razão geral de partidas dobradas**. Cada movimento de saldo gera, na **mesma transação SQL**, um lançamento contábil com débito e crédito de mesmo valor.
+
+**Plano de contas** (do ponto de vista da casa):
+
+| Conta | Tipo | Significado |
+|---|---|---|
+| `wallet:<walletId>` | passivo | dinheiro que a casa deve ao jogador |
+| `provider:<providerId>:<moeda>` | passivo | posição de liquidação com o provedor do jogo |
+| `house:funding:<moeda>` | ativo | caixa recebido quando a wallet é aberta com saldo (`OPENING`) |
+
+**Lançamentos:**
+
+| Operação | Débito | Crédito |
+|---|---|---|
+| `OPENING` | `house:funding` | `wallet` |
+| `BET`, `ROLLBACK` de crédito | `wallet` | `provider` |
+| `WIN`, `REFUND`, `ROLLBACK` de `BET` | `provider` | `wallet` |
+| `LOSS` / rejeitadas | — (sem movimento, sem lançamento) | |
+
+Como a conta da wallet é um passivo, o saldo dela no razão geral (créditos menos débitos) é exatamente o saldo da wallet. A conta do provedor fica com o resultado líquido da casa contra aquele provedor.
+
+**Garantias no schema** (migration `Migration20261101000001_double_entry`):
+- todo lançamento fecha (débitos = créditos), tem pelo menos 2 partidas e uma única moeda, igual à das contas. Isso é verificado no commit por um *constraint trigger* diferido;
+- todo movimento do sub-razão da wallet precisa ter, no commit, a partida correspondente na conta `wallet:<id>` (mesma transação, direção e valor). Também é diferido;
+- um lançamento por transação; contas, lançamentos e partidas são *append-only* (triggers bloqueiam `UPDATE`, `DELETE` e `TRUNCATE`).
+
+No código, a porta `recordMovement(entry, journal)` grava os dois juntos: não existe caminho para registrar um movimento de wallet sem o lançamento contábil.
+
+**Contas quentes:** os saldos das contas contábeis **não** são materializados, só as partidas. Assim, a conta de um provedor, que recebe todas as apostas daquele provedor, não vira uma linha disputada por lock; a única serialização continua sendo a da wallet. Contas são criadas sob demanda com `INSERT … ON CONFLICT DO NOTHING`, que não bloqueia quando a conta já existe.
+
+**Backfill:** a migration gera os lançamentos dos movimentos já existentes. No banco de desenvolvimento, com os dados dos testes de carga, foram 93.761 lançamentos e 187.522 partidas em ~3 s. O balancete fechou em 0,00 e nenhuma wallet divergiu. A migration é reversível.
+
+**Consultas:** a reconciliação (`POST /wallets/:id/reconciliation`) confere também o saldo da wallet no razão geral (`generalLedgerBalance`). `GET /ledger/trial-balance?currency=BRL` devolve o **balancete**: débitos, créditos e saldo natural por grupo de contas (as wallets somadas numa linha), com `balanced: true` quando o total de débitos é igual ao de créditos.
+
 ## 4. Money
 
 - Internamente é um **`bigint` em centavos** (escala fixa 2). A aritmética é exata e não há dependência de biblioteca decimal. `numeric(20,2)` ↔ string decimal ↔ `bigint`, sem passar por `number`.
@@ -139,6 +175,7 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 
 - Se a referência ainda não existe (ou está ela mesma `PENDING`/`PENDING_REFERENCE`), a transação é persistida como `PENDING_REFERENCE` e o evento `WagerTransactionPendingReference` é publicado. A resposta HTTP é `202`.
 - O worker `ResolvePendingReferences` busca as pendências vencidas (`next_reference_check_at <= now()`), relê cada uma **sob o lock da wallet** (vários workers em várias instâncias não aplicam a mesma pendência duas vezes) e roda o mesmo `applyAndRecord`.
+- **Relógio:** a decisão de "venceu?" usa o `now()` do **PostgreSQL**, o único relógio comum a todas as instâncias. Instâncias com relógios levemente diferentes (o teste pegou uma diferença de 185 ms entre o container do banco e o host) não deixam pendências vencidas sem processar. O backoff em si é calculado no app, e um desvio de relógio só o desloca alguns milissegundos. A outbox segue a mesma regra (`next_attempt_at <= now()`, `locked_until < now()`).
 - **Backoff exponencial:** 1 s, 2 s, 4 s… com teto de 5 min. **Limite: 10 tentativas** (configurável), cerca de 8,5 min no total. Isso cobre atrasos normais de entrega entre provedores sem deixar a pendência viva indefinidamente. Esgotado o limite, a transação vira `REJECTED` com `REFERENCE_NOT_FOUND`, e o evento `WagerTransactionRejected` é publicado.
 - **Atalho:** quando uma transação é processada (ou rejeitada), as pendências que dependem dela são "acordadas" na mesma transação SQL (`next_reference_check_at = now()`). Na prática, a reversão é aplicada milissegundos depois de a referência chegar.
 - Um erro não transitório ao reprocessar faz a pendência ir para `FAILED` / `PROCESSING_FAILED`, para não ficar em loop infinito.
@@ -191,7 +228,7 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 | `wagering_consumer_messages_total{outcome}`, `wagering_outbox_published_total`, `wagering_outbox_publish_failures_total` | |
 
 - **Health:** `/health/live` só indica que o processo está vivo; `/health/ready` checa Postgres e SQS e responde 503 se algum falhar.
-- **Reconciliação:** lê saldo e agregados do ledger num mesmo snapshot `REPEATABLE READ` (escritas concorrentes não geram falsa divergência). Verifica a soma e também o `balance_after` do último lançamento. **Nunca corrige nada**: loga em `error`, incrementa a métrica e devolve `consistent: false`.
+- **Reconciliação:** lê saldo e agregados do ledger num mesmo snapshot `REPEATABLE READ` (escritas concorrentes não geram falsa divergência). Verifica a soma do sub-razão, o `balance_after` do último lançamento e o saldo da conta da wallet no razão geral (§3.1). **Nunca corrige nada**: loga em `error`, incrementa a métrica e devolve `consistent: false`.
 
 ## 13. Teste de carga
 
@@ -251,6 +288,5 @@ Apple M5 (10 núcleos, 16 GB), macOS 26.6, OrbStack (Docker 29.8). Tudo na mesma
 - A wallet quente é serializada pelo lock (correto e previsível, mas o throughput fica limitado a 1 transação por vez naquela wallet). Se isso virar gargalo: *sub-wallets* ou *batching* por wallet.
 - O publisher de outbox usa polling (100–500 ms). `LISTEN/NOTIFY` reduziria a latência.
 - A inbox e a outbox crescem sem limite. Faltam jobs de retenção (particionar por data ou arquivar mensagens publicadas com mais de N dias).
-- O ledger é de partida simples (por wallet). O ledger de partidas dobradas (contra contas da casa/provedor) é um diferencial opcional que não implementei.
 - O `lock_timeout` é global, por configuração. Em produção valeria ter também um `statement_timeout` e um limite de concorrência por wallet no consumidor.
 - Sem OpenTelemetry. O `correlationId` está pronto para virar `traceId`.

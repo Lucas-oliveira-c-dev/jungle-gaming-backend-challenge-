@@ -157,17 +157,33 @@ export async function sql<T = Record<string, unknown>>(orm: MikroORM, query: str
   return orm.em.fork().execute<T[]>(query, params);
 }
 
-/** The invariant every test ends with: wallet.balance == balance rebuilt from the ledger. */
+/**
+ * The invariant every test ends with: wallet.balance == balance rebuilt from the wallet
+ * ledger == balance of the wallet account in the double-entry general ledger, and the
+ * general ledger as a whole nets to zero.
+ */
 export async function expectLedgerConsistent(orm: MikroORM, walletIds?: string[]): Promise<void> {
-  const rows = await sql<{ id: string; balance: string; rebuilt: string; entries: string }>(
+  const rows = await sql<{ id: string; balance: string; rebuilt: string; general: string }>(
     orm,
     `select w.id, w.balance::text as balance,
-            coalesce(sum(case l.direction when 'CREDIT' then l.amount else -l.amount end), 0)::numeric(20,2)::text as rebuilt,
-            count(l.id)::text as entries
-       from wallets w left join wallet_ledger_entries l on l.wallet_id = w.id
-      ${walletIds ? 'where w.id = any(?::uuid[])' : ''}
-      group by w.id, w.balance`,
+            (select coalesce(sum(case l.direction when 'CREDIT' then l.amount else -l.amount end), 0)::numeric(20,2)::text
+               from wallet_ledger_entries l where l.wallet_id = w.id) as rebuilt,
+            (select coalesce(sum(case p.direction when 'CREDIT' then p.amount else -p.amount end), 0)::numeric(20,2)::text
+               from journal_postings p where p.account_code = 'wallet:' || w.id) as general
+       from wallets w
+      ${walletIds ? 'where w.id = any(?::uuid[])' : ''}`,
     walletIds ? [`{${walletIds.join(',')}}`] : [],
   );
-  for (const row of rows) expect({ wallet: row.id, balance: row.rebuilt }).toEqual({ wallet: row.id, balance: row.balance });
+  for (const row of rows) {
+    expect({ wallet: row.id, ledger: row.rebuilt, generalLedger: row.general }).toEqual({
+      wallet: row.id,
+      ledger: row.balance,
+      generalLedger: row.balance,
+    });
+  }
+  const [net] = await sql<{ net: string }>(
+    orm,
+    `select coalesce(sum(case direction when 'DEBIT' then amount else -amount end), 0)::numeric(20,2)::text as net from journal_postings`,
+  );
+  expect(net?.net).toBe('0.00');
 }

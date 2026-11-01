@@ -6,6 +6,7 @@ import {
   type EventContext,
   type IntegrationEvent,
 } from '../domain/events';
+import { Accounts, JournalEntry } from '../domain/journal';
 import { applyWager, type WagerOutcome } from '../domain/wagering-policy';
 import type { WagerTransaction } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
@@ -59,7 +60,14 @@ export async function applyAndRecord(
     case 'processed':
       if (outcome.entry) {
         await uow.saveWallet(wallet);
-        await uow.insertLedgerEntry(outcome.entry);
+        await uow.recordMovement(
+          outcome.entry,
+          JournalEntry.forWalletMovement({
+            id: ids.next(),
+            entry: outcome.entry,
+            counterparty: Accounts.provider(tx.providerId, outcome.entry.money.currency),
+          }),
+        );
         events.push(WalletBalanceChanged.from(wallet, outcome.entry, eventCtx()));
       }
       events.push(WagerTransactionProcessed.from(tx, wallet, eventCtx()));
