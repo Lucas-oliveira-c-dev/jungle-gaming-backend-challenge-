@@ -23,6 +23,11 @@ export interface PendingReferenceSchedule {
  * all writes commit or roll back together.
  */
 export interface WageringUnitOfWork {
+  /**
+   * Database time at the start of this transaction. Every timestamp and schedule written in
+   * the transaction uses it, so all instances share one clock (app clocks may be skewed).
+   */
+  now(): Date;
   /** SELECT ... FOR UPDATE on the wallet row: the per-wallet serialization point. */
   lockWallet(walletId: string): Promise<Wallet | null>;
   insertWallet(wallet: Wallet): Promise<void>;

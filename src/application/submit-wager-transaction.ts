@@ -69,8 +69,8 @@ export class SubmitWagerTransaction {
         if (!wallet) throw new WalletNotFoundError(`Wallet ${request.walletId} not found`);
 
         if (ctx.inbox) {
-          const inbox = InboxMessage.receive({ ...ctx.inbox, receivedAt: this.clock.now() });
-          inbox.markProcessed(this.clock.now());
+          const inbox = InboxMessage.receive({ ...ctx.inbox, receivedAt: uow.now() });
+          inbox.markProcessed(uow.now());
           if (!(await uow.registerInbox(inbox))) {
             this.metrics.duplicateDetected('inbox_redelivery');
             const previous = await uow.findTransactionByIdempotencyKey(idempotencyKey);
@@ -85,7 +85,7 @@ export class SubmitWagerTransaction {
           (await uow.findTransactionByExternalId(request.providerId, request.externalTransactionId));
         if (existing) return this.replay(existing, payloadHash, logFields, idempotencyKey);
 
-        const now = this.clock.now();
+        const now = uow.now();
         const tx = WagerTransaction.create({
           id: this.ids.next(),
           ...request,

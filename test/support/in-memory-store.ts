@@ -47,6 +47,7 @@ export class InMemoryStore implements WageringStore {
       return null;
     };
     const uow: WageringUnitOfWork = {
+      now: () => new Date(),
       async lockWallet(id) {
         const w = store.wallets.get(id);
         return w ? Wallet.rehydrate({ ...w, balance: w.balance, version: w.version, updatedAt: w.updatedAt }) : null;

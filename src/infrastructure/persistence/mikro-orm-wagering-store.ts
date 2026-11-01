@@ -37,7 +37,14 @@ import {
  * MikroORM's insert ordering never matters.
  */
 class MikroOrmWageringUnitOfWork implements WageringUnitOfWork {
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    private readonly dbNow: Date,
+  ) {}
+
+  now(): Date {
+    return this.dbNow;
+  }
 
   async lockWallet(walletId: string): Promise<Wallet | null> {
     const record = await this.em.findOne(WalletRecord, { id: walletId }, { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true });
@@ -181,9 +188,12 @@ export class MikroOrmWageringStore implements WageringStore {
 
   async transactional<T>(work: (uow: WageringUnitOfWork) => Promise<T>): Promise<T> {
     return this.orm.em.fork().transactional(async (em) => {
-      // Bound the wait on a hot wallet: a timeout surfaces as a transient (retryable) error.
-      await em.execute(`set local lock_timeout = '${Math.max(1, Math.trunc(this.lockTimeoutMs))}ms'`);
-      return work(new MikroOrmWageringUnitOfWork(em));
+      // One round trip: bound the wait on a hot wallet (a timeout surfaces as a transient,
+      // retryable error) and read the database clock, the single clock every instance shares.
+      const [row] = await em.execute<{ now: Date }[]>(`select set_config('lock_timeout', ?, true), now() as now`, [
+        `${Math.max(1, Math.trunc(this.lockTimeoutMs))}ms`,
+      ]);
+      return work(new MikroOrmWageringUnitOfWork(em, new Date(row!.now)));
     });
   }
 
