@@ -60,9 +60,19 @@ export class PublishOutbox {
         return new Map(messages.map((m) => [m.id, (error as Error).message]));
       }
     }
+    // One by one: after a failure, later events of the same aggregate are held back so
+    // they cannot overtake it.
     const failures = new Map<string, string>();
+    const blocked = new Set<string>();
     for (const message of messages) {
-      await this.publisher.publish(message).catch((error) => failures.set(message.id, (error as Error).message));
+      if (blocked.has(message.aggregateId)) {
+        failures.set(message.id, 'skipped: an earlier event of the same aggregate failed');
+        continue;
+      }
+      await this.publisher.publish(message).catch((error) => {
+        failures.set(message.id, (error as Error).message);
+        blocked.add(message.aggregateId);
+      });
     }
     return failures;
   }

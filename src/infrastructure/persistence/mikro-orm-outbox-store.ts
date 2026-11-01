@@ -27,18 +27,27 @@ export class MikroOrmOutboxStore implements OutboxStore {
       `update outbox_messages o
           set locked_until = now() + make_interval(secs => ?)
         where o.id in (
-          select id from outbox_messages
-           where published_at is null
-             and next_attempt_at <= now()
-             and (locked_until is null or locked_until < now())
-           order by next_attempt_at, occurred_at
+          select c.id from outbox_messages c
+           where c.published_at is null
+             and c.next_attempt_at <= now()
+             and (c.locked_until is null or c.locked_until < now())
+             -- per-aggregate order: never overtake an older event of the same wallet that
+             -- is waiting for a retry or is being published by someone else
+             and not exists (
+               select 1 from outbox_messages older
+                where older.aggregate_id = c.aggregate_id
+                  and older.published_at is null
+                  and older.occurred_at < c.occurred_at
+                  and (older.next_attempt_at > now() or older.locked_until >= now()))
+           order by c.occurred_at, c.id
            limit ?
            for update skip locked)
        returning o.id, o.aggregate_id, o.event_type, o.payload, o.occurred_at, o.attempts, o.next_attempt_at, o.published_at`,
       [leaseSeconds, limit],
     );
     return rows
-      .sort((a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime())
+      // occurred_at ties (events of one transaction) are broken by the time-ordered UUIDv7 id
+      .sort((a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime() || (a.id < b.id ? -1 : 1))
       .map((row) =>
         OutboxMessage.rehydrate({
           id: row.id,
