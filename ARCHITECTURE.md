@@ -37,7 +37,7 @@ Cada instância roda HTTP, consumidor, publisher da outbox e worker de referênc
 
 Todas as entidades seguem o padrão pedido: construtor `private`, factories `create`/`open`/`receive`/`enqueue` (que validam) e `rehydrate` (que **não** revalida transições — só reconstrói o estado persistido). `WalletLedgerEntry` só tem campos `readonly` e nenhum método de transição. Um teste verifica isso olhando o protótipo.
 
-A regra de negócio central está numa função pura de domínio (`applyWager`), que recebe a transação, a wallet já travada e o contexto da referência, e devolve `processed | rejected | pending_reference`. HTTP, SQS e o worker de pendências passam todos pelo mesmo `applyAndRecord`. Não existe um segundo caminho de escrita.
+A regra de negócio central está numa função pura de domínio (`applyWager`), que recebe a transação, a wallet já travada e o contexto da referência, e devolve `processed | rejected | pending_reference`. HTTP, SQS e o worker de pendências passam todos pelo mesmo `applyAndRecord`. Os únicos outros caminhos de escrita são estreitos e não movem saldo por regra de negócio: a abertura de wallet (`OPENING`) e as transições terminais do worker (`REFERENCE_NOT_FOUND`, `FAILED`). Todos gravam pela mesma porta transacional, `WageringUnitOfWork`.
 
 ## 3. Schema: invariantes aplicadas no banco
 
@@ -49,7 +49,7 @@ Migration: [`Migration20261031000001_initial.ts`](src/infrastructure/persistence
 | saldo nunca negativo | `check (balance >= 0)` em `wallets` e em `balance_before/after` do ledger |
 | idempotência persistente | `unique (idempotency_key)` e `unique (provider_id, external_transaction_id)` |
 | no máximo um lançamento por transação/wallet | `unique (wallet_id, transaction_id)` |
-| ledger encadeado e sem buracos por wallet | `sequence` = versão da wallet após o lançamento; `unique (wallet_id, sequence)` |
+| ledger encadeado e sem buracos por wallet | `sequence` = versão da wallet após o lançamento; `unique (wallet_id, sequence)`; *constraint trigger* no commit: cada lançamento continua o anterior (`sequence + 1` e `balance_before` = `balance_after` anterior), e o primeiro parte de zero |
 | aritmética do lançamento | `check (balance_after = balance_before ± amount)` |
 | ledger imutável | triggers `BEFORE UPDATE/DELETE` (por linha) e `BEFORE TRUNCATE` que levantam erro |
 | transação terminal imutável | trigger: `UPDATE` em linha `PROCESSED/REJECTED/FAILED` falha; campos de negócio nunca mudam |
@@ -57,7 +57,7 @@ Migration: [`Migration20261031000001_initial.ts`](src/infrastructure/persistence
 | reversão única por referência | índice único parcial em `reference_transaction_id` onde `kind in (REFUND, ROLLBACK) and status = PROCESSED` |
 | `REFUND`/`ROLLBACK` exigem referência | `check` |
 | `failure_code` existe se e somente se o status for `REJECTED/FAILED` | `check` |
-| **saldo ⇄ ledger** | *constraint trigger* `DEFERRABLE INITIALLY DEFERRED` em `wallets`: no **commit**, o saldo atual precisa ser igual ao `balance_after` do lançamento cuja `sequence = version`. Mudar saldo sem ledger (ou ledger sem saldo) faz o commit falhar |
+| **saldo ⇄ ledger** | *constraint trigger* `DEFERRABLE INITIALLY DEFERRED` em `wallets`: no **commit**, o saldo atual precisa ser igual ao `balance_after` do lançamento cuja `sequence = version` (saldo sem ledger falha). No sentido inverso, um trigger no ledger exige que a versão da wallet seja a do último lançamento (ledger sem saldo também falha) |
 | inbox | `primary key (consumer_name, message_id)` |
 | dinheiro exato | `numeric(20,2)`. Nunca `float` |
 
@@ -121,7 +121,7 @@ No código, a porta `recordMovement(entry, journal)` grava os dois juntos: não 
 6. persist de transação, ledger, wallet (o change set do UoW) e outbox;
 7. flush + commit. O trigger diferido valida saldo ⇄ ledger.
 
-Usei SQL direto apenas onde o UoW não ajuda: `ON CONFLICT DO NOTHING` da inbox, claim da outbox com `SKIP LOCKED` e os agregados de reconciliação.
+Usei SQL direto onde o UoW não ajuda: `ON CONFLICT DO NOTHING` (inbox e contas contábeis), o `now()` do banco no início da transação, `wakePendingDependents`, a busca de pendências vencidas, o claim/marcação/retry da outbox (`SKIP LOCKED`, lease) e os agregados de reconciliação e balancete.
 
 ## 6. Concorrência
 
@@ -152,11 +152,11 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 | `REVERSAL_INSUFFICIENT_FUNDS` | REJECTED | `ROLLBACK` de um crédito (WIN/REFUND) deixaria o saldo negativo. Código **distinto** de uma aposta sem saldo, porque operacionalmente é outra situação: dinheiro já creditado e possivelmente sacado |
 | `CURRENCY_MISMATCH` | REJECTED | moeda da operação diferente da moeda da wallet |
 | `PLAYER_WALLET_MISMATCH` | REJECTED | a wallet não é do `playerId` informado |
-| `REFERENCE_NOT_FOUND` | REJECTED | a referência não chegou dentro do limite de tentativas |
+| `REFERENCE_NOT_FOUND` | REJECTED | nenhuma transação `(providerId, referenceExternalTransactionId)` chegou dentro do limite de tentativas. A busca é sempre dentro do mesmo provider, como pede o enunciado, então uma referência a outro provider também termina aqui |
 | `REFERENCE_MISMATCH` | REJECTED | a referência é de outro player, wallet, moeda ou rodada |
 | `REFERENCE_KIND_NOT_ALLOWED` | REJECTED | ex.: `REFUND` de um `WIN`, `ROLLBACK` de um `LOSS` |
 | `REFERENCE_NOT_PROCESSED` | REJECTED | a referência foi rejeitada ou falhou |
-| `REFERENCE_ALREADY_REVERSED` | REJECTED | a referência já foi revertida |
+| `REFERENCE_ALREADY_REVERSED` | REJECTED | a referência já foi revertida, seja por um novo `REFUND`/`ROLLBACK` ou por um `WIN`/`LOSS` tentando liquidar uma aposta cancelada |
 | `REVERSAL_AMOUNT_MISMATCH` | REJECTED | valor diferente do da referência (reversão parcial está fora de escopo) |
 | `PROCESSING_FAILED` | FAILED | erro permanente (não transitório) ao reprocessar uma pendência. Fica para auditoria |
 
@@ -176,7 +176,7 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 - Se a referência ainda não existe (ou está ela mesma `PENDING`/`PENDING_REFERENCE`), a transação é persistida como `PENDING_REFERENCE` e o evento `WagerTransactionPendingReference` é publicado. A resposta HTTP é `202`.
 - O worker `ResolvePendingReferences` busca as pendências vencidas (`next_reference_check_at <= now()`), relê cada uma **sob o lock da wallet** (vários workers em várias instâncias não aplicam a mesma pendência duas vezes) e roda o mesmo `applyAndRecord`.
 - **Relógio:** a decisão de "venceu?" usa o `now()` do **PostgreSQL**, o único relógio comum a todas as instâncias. Instâncias com relógios levemente diferentes (o teste pegou uma diferença de 185 ms entre o container do banco e o host) não deixam pendências vencidas sem processar. O backoff em si é calculado no app, e um desvio de relógio só o desloca alguns milissegundos. A outbox segue a mesma regra (`next_attempt_at <= now()`, `locked_until < now()`).
-- **Backoff exponencial:** 1 s, 2 s, 4 s… com teto de 5 min. **Limite: 10 tentativas** (configurável), cerca de 8,5 min no total. Isso cobre atrasos normais de entrega entre provedores sem deixar a pendência viva indefinidamente. Esgotado o limite, a transação vira `REJECTED` com `REFERENCE_NOT_FOUND`, e o evento `WagerTransactionRejected` é publicado.
+- **Backoff exponencial:** 1 s, 2 s, 4 s… com teto de 5 min por espera. **Limite: 10 verificações sem encontrar a referência** (configurável). A 10ª acontece ~811 s (cerca de **13,5 min**) depois da chegada. Se a referência **existe mas ainda está ela mesma pendente**, a verificação não consome o orçamento: a dependente espera a referência se resolver ou ser rejeitada no prazo dela. Isso cobre atrasos normais de entrega entre provedores sem deixar a pendência viva indefinidamente. Esgotado o limite, a transação vira `REJECTED` com `REFERENCE_NOT_FOUND`, e o evento `WagerTransactionRejected` é publicado.
 - **Atalho:** quando uma transação é processada (ou rejeitada), as pendências que dependem dela são "acordadas" na mesma transação SQL (`next_reference_check_at = now()`). Na prática, a reversão é aplicada milissegundos depois de a referência chegar.
 - Um erro não transitório ao reprocessar faz a pendência ir para `FAILED` / `PROCESSING_FAILED`, para não ficar em loop infinito.
 
@@ -189,12 +189,14 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 | Tipo | Exemplos | Ação |
 |---|---|---|
 | negócio | `REJECTED`, `WALLET_NOT_FOUND` | ack (terminal) |
-| permanente | JSON inválido, payload inválido, `IDEMPOTENCY_CONFLICT` | envia para a DLQ com `failureReason` e faz ack |
+| permanente | JSON inválido, payload inválido, `IDEMPOTENCY_CONFLICT`, violação de invariante de domínio | envia para a DLQ com `failureReason` e faz ack |
 | transitório | Postgres fora do ar, `lock_timeout`, deadlock, conexão | devolve à fila com `ChangeMessageVisibility` em backoff (2, 4, 8… até 60 s) |
 | limite atingido | `ApproximateReceiveCount >= SQS_MAX_RECEIVE_COUNT` (5) | envia para a DLQ (`MAX_RECEIVE_COUNT_EXCEEDED`) |
 
   O consumidor move a mensagem para a DLQ por conta própria, para não depender de como cada emulador implementa a redrive policy. A `RedrivePolicy` da fila também está configurada (com `maxReceiveCount + 1`) como rede de segurança.
-- **SIGTERM:** para de buscar mensagens (aborta o long poll), termina a mensagem em andamento de cada loop, devolve a visibilidade (`VisibilityTimeout=0`) das que ainda não começaram, e só então fecha HTTP e banco. Um watchdog de 25 s evita travar o shutdown.
+- **Ordem e visibilidade no lote:** as mensagens de um mesmo grupo FIFO são processadas em sequência. Se uma volta para retry, as seguintes do mesmo grupo naquele lote são adiadas junto (não passam na frente). Se o lote demora (wallet quente), a visibilidade das restantes é estendida antes de expirar.
+- **Robustez:** uma falha do próprio SQS (por exemplo, ao mover para a DLQ) nunca derruba o loop do consumidor: a mensagem fica para redelivery. Uma falha no `ack` **depois** do commit também não é tratada como erro de processamento; a redelivery é absorvida pela inbox, em vez de ir para a DLQ por engano.
+- **SIGTERM:** para de buscar mensagens (aborta o long poll), termina a mensagem em andamento de cada loop, devolve a visibilidade (`VisibilityTimeout=0`) das que ainda não começaram, e só então fecha HTTP e banco. O readiness passa a responder 503 (`draining`) logo no início. Um watchdog de 25 s garante a saída (código 1 se o shutdown travar ou falhar).
 - **Crash depois do commit e antes do ack:** a mensagem volta após o visibility timeout. A inbox detecta o `messageId` e o consumidor responde com replay, sem efeito novo. Há um teste com `SIGKILL` real (`FAULT_CRASH_AFTER_COMMIT`).
 
 ## 11. Transactional Outbox
@@ -202,9 +204,10 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 - Os eventos são gravados em `outbox_messages` **na mesma transação** que o saldo, o ledger e a inbox. Nada é publicado antes do commit.
 - **Publisher concorrente:** `UPDATE … SET locked_until = now() + lease WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT n) RETURNING *`. A linha fica reservada por um *lease* e a publicação no SQS acontece **fora** de qualquer transação SQL, sem segurar lock durante I/O de rede.
 - **Crash do publisher:** se a instância morre depois de reservar e antes de marcar `published_at`, o lease expira (30 s) e outra instância publica. A entrega é **at-least-once**: o `eventId` é estável, é usado como `MessageDeduplicationId` no SQS FIFO e permite deduplicação no consumidor.
-- **Vazão:** cada execução reserva até 200 eventos e os distribui em 8 *faixas* pelo hash do `aggregateId`. As faixas enviam em paralelo com `SendMessageBatch` (10 por chamada); dentro de uma faixa o envio é sequencial, então a ordem por wallet é preservada. Se um lote falha, o resto da faixa é adiado (para que nenhum evento posterior da mesma wallet passe na frente), sem afetar as outras faixas. A marcação como publicado é um único `UPDATE … WHERE id = any(…)`.
+- **Vazão:** cada execução reserva até 200 eventos e os distribui em 8 *faixas* pelo hash do `aggregateId`. As faixas enviam em paralelo com `SendMessageBatch` (10 por chamada); dentro de uma faixa o envio é sequencial, então a ordem por wallet é preservada. Se um lote falha, o resto da faixa é adiado, sem afetar as outras faixas. Num lote com falha *parcial* (`Failed` em algumas entradas), as entradas seguintes do mesmo lote já foram aceitas pelo broker; é o único caso em que um evento pode chegar antes de um anterior, e o `walletVersion` resolve. A marcação como publicado é um único `UPDATE … WHERE id = any(…)`.
 - **Falha ao publicar:** `attempts++` e `next_attempt_at` com backoff exponencial e jitter (1 s até 5 min). O último erro fica gravado.
-- **Ordem entre instâncias:** é *best effort*. Duas instâncias podem reservar eventos da mesma wallet em lotes diferentes. Para os consumidores, a referência de ordem é o `walletVersion` de `WalletBalanceChanged` (monotônico por wallet), não a ordem de chegada.
+- **Ordem depois de falhas:** o claim nunca reserva um evento se houver um evento **mais antigo da mesma wallet** aguardando retry ou em publicação por outra instância (`NOT EXISTS` com índice por agregado). Um evento novo não passa na frente de um atrasado.
+- **Ordem entre instâncias:** é *best effort* na janela em que dois claims concorrentes ainda não confirmaram seus leases. Para os consumidores, a referência de ordem é o `walletVersion` de `WalletBalanceChanged` (monotônico por wallet), não a ordem de chegada.
 - Eventos: `WagerTransactionProcessed` (inclusive para `LOSS` e `OPENING`), `WagerTransactionRejected`, `WalletBalanceChanged` (somente quando o saldo muda) e `WagerTransactionPendingReference`. São publicados em `wagering-events.fifo` com `MessageGroupId = walletId`, preservando a ordem por wallet.
 - O envelope é uma classe abstrata `IntegrationEvent<T>`, com uma subclasse por evento; `eventType` e `version` ficam no tipo. `data` só carrega `MoneyProps` (strings), nunca instâncias de `Money`.
 
@@ -227,7 +230,9 @@ FIFO do SQS (`MessageGroupId = walletId`) reduz contenção e preserva a ordem p
 | `wagering_reconciliation_divergences_total` | divergências entre saldo e ledger |
 | `wagering_consumer_messages_total{outcome}`, `wagering_outbox_published_total`, `wagering_outbox_publish_failures_total` | |
 
-- **Health:** `/health/live` só indica que o processo está vivo; `/health/ready` checa Postgres e SQS e responde 503 se algum falhar.
+- **Health:** `/health/live` só indica que o processo está vivo; `/health/ready` checa Postgres e SQS, cada um com timeout de 2 s, e responde 503 se algum falhar ou se a instância estiver em shutdown.
+- **Métricas depois do commit:** `wagering_transactions_total` e o log "wager transaction recorded" só são emitidos depois do commit, então um commit rejeitado por um trigger diferido não é contado.
+- **DLQ:** `wagering_dlq_messages_total` conta as mensagens que o consumidor moveu para a DLQ (todos os casos de limite e de erro permanente). As que a `RedrivePolicy` mover como rede de segurança aparecem na profundidade da DLQ, que deve ser monitorada no broker (CloudWatch `ApproximateNumberOfMessagesVisible`).
 - **Reconciliação:** lê saldo e agregados do ledger num mesmo snapshot `REPEATABLE READ` (escritas concorrentes não geram falsa divergência). Verifica a soma do sub-razão, o `balance_after` do último lançamento e o saldo da conta da wallet no razão geral (§3.1). **Nunca corrige nada**: loga em `error`, incrementa a métrica e devolve `consistent: false`.
 
 ## 13. Teste de carga
@@ -275,12 +280,13 @@ Apple M5 (10 núcleos, 16 GB), macOS 26.6, OrbStack (Docker 29.8). Tudo na mesma
 ## 15. Interpretações adotadas
 
 - **"Não pode ser revertida duas vezes pelo mesmo tipo de operação":** apliquei uma regra mais forte, de **uma reversão no total por referência**. Uma `BET` com `REFUND` não aceita também um `ROLLBACK`, porque isso creditaria a aposta duas vezes. Ainda é possível encadear: `BET → REFUND → ROLLBACK(do REFUND)`, já que o `ROLLBACK` reverte outra transação. A regra é aplicada sob o lock e garantida por índice único parcial.
-- **`WIN`/`LOSS` com referência:** opcional. Se informada, precisa ser uma `BET` `PROCESSED` da mesma rodada, player, wallet e moeda; se ainda não chegou, a transação fica `PENDING_REFERENCE`.
+- **`WIN`/`LOSS` com referência:** opcional. Se informada, precisa ser uma `BET` `PROCESSED` e **não revertida** da mesma rodada, player, wallet e moeda; se ainda não chegou, a transação fica `PENDING_REFERENCE`. Vários `WIN` para a mesma `BET` são aceitos (jogos com várias linhas de prêmio), e um `ROLLBACK` de `BET` depois de um `WIN` também (o provedor é a fonte da verdade sobre a rodada).
+- **UUIDs** são normalizados para minúsculas na entrada (maiúsculas são válidas e representam o mesmo id). Uma transação que referencia a si mesma é payload inválido (400).
 - **`LOSS`** aceita valor `0.00` (só registra o resultado). As demais operações exigem valor maior que zero.
 - **`ROLLBACK`** é aceito para `BET`, `WIN` e `REFUND`, com direção inversa à da referência. `ROLLBACK` de `LOSS` ou de outro `ROLLBACK` é `REFERENCE_KIND_NOT_ALLOWED`.
 - **Wallet inexistente** na submissão: `422 WALLET_NOT_FOUND`, sem persistir (sem wallet, não existe agregado dono do registro). No SQS conta como erro de negócio (ack).
 - **Versão da wallet:** `version = 1` ao criar. Com saldo inicial maior que zero, o lançamento `OPENING` é a sequência 1, então a resposta da criação mostra `version: 1`, como no exemplo do enunciado. Wallets criadas com saldo zero começam em `version 1` sem lançamento; o primeiro movimento é a sequência 2.
-- **Valores de entrada** aceitam de 0 a 2 casas decimais (`"25"`, `"25.5"`, `"25.00"`), sempre normalizados para 2 casas na saída e no hash.
+- **Valores de entrada** aceitam de 0 a 2 casas decimais (`"25"`, `"25.5"`, `"25.00"`), sempre normalizados para 2 casas na saída e no hash. **Arredondamento:** mais de 2 casas é **rejeitado**, nunca arredondado. Num contrato financeiro, arredondar em silêncio um valor enviado pelo provedor criaria divergência entre o nosso ledger e o dele. Como o `Money` é exato e só soma e subtrai, nenhuma operação interna produz frações que exijam arredondamento.
 - **Conflito de idempotência no SQS** vai para a DLQ, não recebe ack silencioso: é um erro do produtor que precisa de investigação humana.
 
 ## 16. Limitações e próximos passos
@@ -288,5 +294,7 @@ Apple M5 (10 núcleos, 16 GB), macOS 26.6, OrbStack (Docker 29.8). Tudo na mesma
 - A wallet quente é serializada pelo lock (correto e previsível, mas o throughput fica limitado a 1 transação por vez naquela wallet). Se isso virar gargalo: *sub-wallets* ou *batching* por wallet.
 - O publisher de outbox usa polling (100–500 ms). `LISTEN/NOTIFY` reduziria a latência.
 - A inbox e a outbox crescem sem limite. Faltam jobs de retenção (particionar por data ou arquivar mensagens publicadas com mais de N dias).
+- **Pool:** obter uma conexão tem timeout de 5 s (`DB_ACQUIRE_TIMEOUT_MS`). Com o pool esgotado (muitas requisições esperando a mesma wallet quente), as demais falham rápido com 503 em vez de esperar 60 s.
+- **Custos aceitos no caminho quente:** cada movimento faz um `INSERT … ON CONFLICT DO NOTHING` das contas contábeis, e a verificação de balanço do lançamento roda uma vez por partida. São idas extras pequenas, trocadas por garantias no banco. O balancete agrega todas as partidas a cada chamada; em produção, viraria uma visão materializada ou rodaria numa réplica de leitura.
 - O `lock_timeout` é global, por configuração. Em produção valeria ter também um `statement_timeout` e um limite de concorrência por wallet no consumidor.
 - Sem OpenTelemetry. O `correlationId` está pronto para virar `traceId`.

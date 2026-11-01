@@ -11,7 +11,7 @@ As decisões de projeto, trade-offs e limitações estão em [ARCHITECTURE.md](A
 ## Pré-requisitos
 
 - Docker (Docker Desktop ou OrbStack) com Compose v2
-- Bun ≥ 1.3 (só para rodar os testes e scripts fora do container)
+- Bun 1.4 (só para rodar os testes e scripts fora do container)
 
 ## Subindo tudo
 
@@ -38,6 +38,7 @@ As filas (`wager-transactions.fifo`, `wager-transactions-dlq.fifo`, `wagering-ev
 bun install
 docker compose up -d postgres sqs
 bun run migrate            # aplica migrations
+bun run queues:setup       # opcional: a aplicação também cria as filas ao iniciar
 bun run dev                # http://localhost:3000
 ```
 
@@ -99,9 +100,9 @@ O mesmo status para a mesma situação em todos os endpoints:
 | `409` | conflito de idempotência (`IDEMPOTENCY_CONFLICT`) ou wallet duplicada | **não** reenviar; investigar |
 | `422` | rejeição por regra de negócio — corpo traz `status: REJECTED` + `failureCode` (ou `WALLET_NOT_FOUND`) | desistir ou corrigir |
 | `503` | falha transitória de infraestrutura (`retryable: true`, `Retry-After`) | **reenviar a mesma requisição** |
-| `500` | erro inesperado | reenviar com backoff |
+| `500` | erro inesperado, ou replay de uma transação `FAILED` (erro permanente de infraestrutura, auditável) | reenviar com backoff / investigar |
 
-Erros sempre têm o formato `{ "error": { "code", "message", "retryable" }, "correlationId" }`. Os `failureCode` estão documentados em [ARCHITECTURE.md](ARCHITECTURE.md#7-códigos-de-falha).
+Respostas sobre uma transação (`201`, `200`, `202`, `422` com `status: REJECTED`, `500` com `status: FAILED`) têm o formato do resultado da transação. Os demais erros têm o formato `{ "error": { "code", "message", "retryable" }, "correlationId" }`. Os `failureCode` estão documentados em [ARCHITECTURE.md](ARCHITECTURE.md#7-códigos-de-falha).
 
 ## Testes
 
@@ -115,7 +116,7 @@ bun run test                # tudo
 bun run typecheck
 ```
 
-A suíte de concorrência sobe **processos `bun src/main.ts` reais** (não mocks) e cobre: a mesma aposta 50× em paralelo, a disputa 100/80/80, wallets distintas em paralelo, 3 instâncias simultâneas, `SIGKILL` depois do commit e antes do ack, publishers concorrentes, `REFUND` antes da `BET` e reinício no meio da carga. Todo teste termina verificando `wallet.balance == saldo reconstruído pelo ledger`.
+A suíte de concorrência sobe **processos `bun src/main.ts` reais** (não mocks) e cobre: a mesma aposta 50× em paralelo, a disputa 100/80/80, wallets distintas em paralelo, 3 instâncias simultâneas, `SIGKILL` depois do commit e antes do ack, publishers concorrentes, `REFUND` antes da `BET` e reinício no meio da carga. Toda suíte de integração e concorrência termina verificando, para todas as wallets, `wallet.balance == saldo reconstruído pelo ledger == saldo da conta no razão geral`, e que o razão geral soma zero.
 
 ### Teste de carga (opcional)
 
