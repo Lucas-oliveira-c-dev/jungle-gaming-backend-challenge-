@@ -4,6 +4,7 @@ export interface AppConfig {
   port: number;
   databaseUrl: string;
   dbPoolMax: number;
+  dbAcquireTimeoutMs: number;
   lockTimeoutMs: number;
   sqs: {
     endpoint: string;
@@ -43,6 +44,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     port: int(env.PORT, 3000),
     databaseUrl: env.DATABASE_URL ?? 'postgres://wagering:wagering@localhost:5432/wagering',
     dbPoolMax: int(env.DB_POOL_MAX, 20),
+    dbAcquireTimeoutMs: int(env.DB_ACQUIRE_TIMEOUT_MS, 5_000),
     lockTimeoutMs: int(env.LOCK_TIMEOUT_MS, 5_000),
     sqs: {
       endpoint: env.SQS_ENDPOINT ?? 'http://localhost:4566',

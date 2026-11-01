@@ -67,9 +67,14 @@ export async function createApplication(config: AppConfig): Promise<Application>
     config.workers.pendingReferenceMaxAttempts,
   );
 
+  // Each probe is bounded so readiness answers even when the pool or broker hangs.
+  const withinTimeout = (probe: Promise<boolean>) =>
+    Promise.race([probe.catch(() => false), Bun.sleep(2_000).then(() => false)]);
+  let draining = false;
   const health: HealthProbe = {
-    database: () => orm.isConnected(),
-    queue: () => queueReachable(sqs, config.sqs.transactionsQueue),
+    database: () => withinTimeout(orm.isConnected()),
+    queue: () => withinTimeout(queueReachable(sqs, config.sqs.transactionsQueue)),
+    draining: () => draining,
   };
 
   @Module({
@@ -133,7 +138,9 @@ export async function createApplication(config: AppConfig): Promise<Application>
       logger.info({ port: config.port }, 'wagering processor started');
     },
     async stop() {
-      // Order matters: stop intake first, drain in-flight work, then close resources.
+      // Order matters: report not-ready (load balancers stop routing), stop intake, drain
+      // in-flight work, then close resources.
+      draining = true;
       await consumer.stop();
       await Promise.all([outboxWorker.stop(), pendingWorker.stop()]);
       await http.close();

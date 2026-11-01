@@ -133,6 +133,8 @@ export class WageringController {
 export interface HealthProbe {
   database(): Promise<boolean>;
   queue(): Promise<boolean>;
+  /** True during graceful shutdown. */
+  draining(): boolean;
 }
 
 /** Health endpoints are public (no guard). */
@@ -150,6 +152,10 @@ export class OpsController {
 
   @Get('health/ready')
   async ready(@Res() res: Response) {
+    if (this.health.draining()) {
+      res.status(503).json({ status: 'draining', checks: {} });
+      return;
+    }
     const [database, queue] = await Promise.all([this.health.database(), this.health.queue()]);
     const ok = database && queue;
     res.status(ok ? 200 : 503).json({ status: ok ? 'ok' : 'unavailable', checks: { postgres: database, sqs: queue } });

@@ -4,7 +4,7 @@ x-app: &app
   build: .
   depends_on:
     postgres: { condition: service_healthy }
-    sqs: { condition: service_started }
+    sqs: { condition: service_healthy }
     migrate: { condition: service_completed_successfully }
   environment: &app-env
     DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
@@ -36,7 +36,7 @@ services:
 
   # MiniStack: MIT-licensed, token-free AWS emulator (LocalStack >= 2026.03 requires an auth token).
   sqs:
-    image: ministackorg/ministack:latest
+    image: ministackorg/ministack:1.5.35 # pinned: the version the suites were run against
     ports: ["4566:4566"]
 
   migrate:

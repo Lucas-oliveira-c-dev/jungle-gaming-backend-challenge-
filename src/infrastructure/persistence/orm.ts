@@ -12,6 +12,9 @@ export function ormConfig(config: Pick<AppConfig, 'databaseUrl' | 'dbPoolMax'> &
     entities: ENTITY_SCHEMAS,
     discovery: { warnWhenNoEntities: false },
     pool: { min: 0, max: config.dbPoolMax },
+    // Fail fast when the pool is exhausted (e.g. connections waiting on a hot wallet): the
+    // error is classified as transient (503 / SQS retry) instead of hanging for knex's 60 s.
+    driverOptions: { acquireConnectionTimeout: config.dbAcquireTimeoutMs ?? 5_000 },
     // Explicit list: works the same under Bun, in Docker and in tests (no glob discovery).
     migrations: {
       migrationsList: [
@@ -31,6 +34,6 @@ export function ormConfig(config: Pick<AppConfig, 'databaseUrl' | 'dbPoolMax'> &
   });
 }
 
-export async function initOrm(config: Pick<AppConfig, 'databaseUrl' | 'dbPoolMax'>): Promise<MikroORM> {
+export async function initOrm(config: Pick<AppConfig, 'databaseUrl' | 'dbPoolMax'> & { dbAcquireTimeoutMs?: number }): Promise<MikroORM> {
   return MikroORM.init(ormConfig(config));
 }
