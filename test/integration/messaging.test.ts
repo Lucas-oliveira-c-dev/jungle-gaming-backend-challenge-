@@ -227,6 +227,27 @@ describe('atomicity, SQS consumer and transactional outbox', () => {
     expect(changed.data).toMatchObject({ walletId: w.walletId, direction: 'CREDIT', money: { amount: '10.00', currency: 'BRL' }, walletVersion: 1 });
   });
 
+  test('retention purges only old published outbox rows and old inbox rows', async () => {
+    await createWallet(baseUrl(), '10.00'); // 2 fresh outbox rows
+    const fresh = await sql<{ id: string }>(t.app.orm, `select id from outbox_messages order by occurred_at desc limit 2`);
+    const [oldPublished, oldPending] = await sql<{ id: string }>(t.app.orm, `select id from outbox_messages where id <> all(?::uuid[]) limit 2`, [
+      `{${fresh.map((r) => r.id).join(',')}}`,
+    ]);
+    await sql(t.app.orm, `update outbox_messages set published_at = now() - interval '30 days' where id = ?`, [oldPublished!.id]);
+    await sql(t.app.orm, `update outbox_messages set published_at = null, occurred_at = now() - interval '30 days' where id = ?`, [oldPending!.id]);
+    await sql(t.app.orm, `insert into inbox_messages values ('retention', 'old', ?, now() - interval '20 days', now() - interval '20 days'),
+                                                           ('retention', 'recent', ?, now() - interval '10 days', now() - interval '10 days')`, ['a'.repeat(64), 'a'.repeat(64)]);
+
+    while ((await t.app.retention.runOnce()) > 0) {
+      /* drain */
+    }
+    const exists = async (table: string, where: string, params: unknown[]) => (await sql(t.app.orm, `select 1 from ${table} where ${where}`, params)).length === 1;
+    expect(await exists('outbox_messages', 'id = ?', [oldPublished!.id])).toBe(false); // old + published -> purged
+    expect(await exists('outbox_messages', 'id = ?', [oldPending!.id])).toBe(true); // never purge unpublished
+    expect(await exists('inbox_messages', `consumer_name = 'retention' and message_id = ?`, ['old'])).toBe(false);
+    expect(await exists('inbox_messages', `consumer_name = 'retention' and message_id = ?`, ['recent'])).toBe(true); // < 15 days
+  });
+
   function baseUrl() {
     return `http://127.0.0.1:${(t.app.http.getHttpServer().address() as { port: number }).port}`;
   }

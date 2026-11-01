@@ -29,6 +29,10 @@ export interface AppConfig {
     pendingReference: boolean;
     pendingReferencePollMs: number;
     pendingReferenceMaxAttempts: number;
+    retention: boolean;
+    retentionIntervalMs: number;
+    outboxRetentionDays: number;
+    inboxRetentionDays: number;
   };
   /** Test-only fault injection: SIGKILL self right after commit, before the SQS ack. */
   crashAfterCommit: boolean;
@@ -69,6 +73,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       pendingReference: bool(env.WORKER_PENDING_REFERENCE, true),
       pendingReferencePollMs: int(env.PENDING_REFERENCE_POLL_MS, 500),
       pendingReferenceMaxAttempts: int(env.PENDING_REFERENCE_MAX_ATTEMPTS, 10),
+      retention: bool(env.WORKER_RETENTION, true),
+      retentionIntervalMs: int(env.RETENTION_INTERVAL_MS, 60 * 60_000),
+      outboxRetentionDays: int(env.OUTBOX_RETENTION_DAYS, 7),
+      inboxRetentionDays: int(env.INBOX_RETENTION_DAYS, 15),
     },
     crashAfterCommit: bool(env.FAULT_CRASH_AFTER_COMMIT, false),
   };

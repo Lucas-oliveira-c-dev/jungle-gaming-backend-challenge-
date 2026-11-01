@@ -20,6 +20,7 @@ import { createLogger, NestPinoLogger } from './infrastructure/observability/log
 import { PrometheusMetrics } from './infrastructure/observability/metrics';
 import { MikroOrmOutboxStore } from './infrastructure/persistence/mikro-orm-outbox-store';
 import { MikroOrmReadModel } from './infrastructure/persistence/mikro-orm-read-model';
+import { MikroOrmRetention } from './infrastructure/persistence/mikro-orm-retention';
 import { MikroOrmWageringStore } from './infrastructure/persistence/mikro-orm-wagering-store';
 import { initOrm } from './infrastructure/persistence/orm';
 import { PollingWorker } from './workers/polling-worker';
@@ -35,6 +36,7 @@ export interface Application {
   submit: SubmitWagerTransaction;
   outboxPublisher: PublishOutbox;
   pendingReferences: ResolvePendingReferences;
+  retention: MikroOrmRetention;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -114,6 +116,13 @@ export async function createApplication(config: AppConfig): Promise<Application>
       : undefined,
   });
   const outboxWorker = new PollingWorker('outbox-publisher', () => outboxPublisher.runOnce(), config.workers.outboxPollMs, logger);
+  const retention = new MikroOrmRetention(orm, {
+    outboxDays: config.workers.outboxRetentionDays,
+    inboxDays: config.workers.inboxRetentionDays,
+    batchSize: 5_000,
+  });
+  // Drains in batches back to back, then sleeps for the interval.
+  const retentionWorker = new PollingWorker('retention', () => retention.runOnce(), config.workers.retentionIntervalMs, logger);
   const pendingWorker = new PollingWorker(
     'pending-reference',
     () => pendingReferences.runOnce(),
@@ -130,11 +139,13 @@ export async function createApplication(config: AppConfig): Promise<Application>
     submit,
     outboxPublisher,
     pendingReferences,
+    retention,
     async start() {
       await http.listen(config.port);
       if (config.workers.consumer) consumer.start();
       if (config.workers.outboxPublisher) outboxWorker.start();
       if (config.workers.pendingReference) pendingWorker.start();
+      if (config.workers.retention) retentionWorker.start();
       logger.info({ port: config.port }, 'wagering processor started');
     },
     async stop() {
@@ -142,7 +153,7 @@ export async function createApplication(config: AppConfig): Promise<Application>
       // in-flight work, then close resources.
       draining = true;
       await consumer.stop();
-      await Promise.all([outboxWorker.stop(), pendingWorker.stop()]);
+      await Promise.all([outboxWorker.stop(), pendingWorker.stop(), retentionWorker.stop()]);
       await http.close();
       await orm.close();
       sqs.destroy();
